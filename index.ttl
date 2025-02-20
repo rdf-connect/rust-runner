@@ -1,0 +1,18 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>.
+@prefix rdfc: <https://www.rdf-connect.com/#>.
+@prefix sh: <http://www.w3.org/ns/shacl#>.
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#>.
+@prefix testing: <http://www.rdf-connect.com/testing#>.
+
+[ ] a rdfc:Package;
+  rdfc:version "0.0.1";
+  rdfc:author "Arthur Vercruysse";
+  rdfc:description "Simple package only containing the ts runner.";
+  rdfc:repo "https://github.com/rdf-connect/orchestrator.git";
+  rdfc:prepare ( "cargo build" );
+  rdfc:runners testing:RustRunner.
+
+testing:RustRunner a rdfc:GRPCRunner;
+  rdfc:wd <./>;
+  rdfc:entrypoint "./target/debug/runner".
+
