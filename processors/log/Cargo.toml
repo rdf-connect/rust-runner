@@ -8,3 +8,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rdfc-processor-sdk = { path = "../../processor-sdk" }
+serde = { version = "1", features = ["derive"] }

@@ -734,6 +734,7 @@ name = "rdfc-processor-echo"
 version = "0.1.0"
 dependencies = [
  "rdfc-processor-sdk",
+ "serde",
 ]
 
 [[package]]
@@ -741,12 +742,14 @@ name = "rdfc-processor-log"
 version = "0.1.0"
 dependencies = [
  "rdfc-processor-sdk",
+ "serde",
 ]
 
 [[package]]
 name = "rdfc-processor-sdk"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 
@@ -755,7 +758,7 @@ name = "rdfc-processor-send"
 version = "0.1.0"
 dependencies = [
  "rdfc-processor-sdk",
- "serde_json",
+ "serde",
 ]
 
 [[package]]

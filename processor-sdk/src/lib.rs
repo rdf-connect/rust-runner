@@ -10,11 +10,15 @@
 //! ```rust,no_run
 //! use rdfc_processor_sdk::*;
 //!
-//! fn my_processor(ctx: ProcessorContext) -> Result<(), String> {
-//!     let reader = ctx.reader("input")?;
-//!     let writer = ctx.writer("output")?;
-//!     while let Some(msg) = reader.next_bytes() {
-//!         writer.write_bytes(&msg).map_err(|e| e)?;
+//! #[derive(Deserialize)]
+//! struct Config {
+//!     reader: Reader,
+//!     writer: Writer,
+//! }
+//!
+//! fn my_processor(Config { reader, writer }: Config) -> Result<(), String> {
+//!     for bytes in reader.iter_bytes() {
+//!         writer.write_bytes(&bytes)?;
 //!     }
 //!     writer.close();
 //!     Ok(())
@@ -22,14 +26,12 @@
 //!
 //! rdfc_export!(my_processor);
 //! ```
-//!
-//! The runner config for such a processor would point to the compiled `.so`:
-//! ```json
-//! { "file": "/path/to/libmy_processor.so" }
-//! ```
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+
+pub use serde::Deserialize;
 
 // ── FFI primitives ────────────────────────────────────────────────────────────
 
@@ -71,7 +73,7 @@ pub type FreeDataFn = unsafe extern "C" fn(ptr: *mut u8, len: usize);
 /// Each field is valid for the lifetime of the `rdfc_run` call.
 #[repr(C)]
 pub struct RdfcChannel {
-    /// Null-terminated channel URI string (owned by the runner).
+    /// Channel URI string (not null-terminated).
     pub uri: *const u8,
     pub uri_len: usize,
 
@@ -107,9 +109,14 @@ pub struct RdfcArgs {
     pub n_writers: usize,
 }
 
-// ── Ergonomic wrappers ────────────────────────────────────────────────────────
+// ── Channel wrappers ──────────────────────────────────────────────────────────
 
 /// Ergonomic reader backed by the FFI [`RdfcChannel`].
+///
+/// Implements [`serde::Deserialize`]: when a field is annotated with type
+/// `Reader` in a `#[derive(Deserialize)]` config struct, the deserializer reads
+/// the `@id` URI from the JSON-LD channel reference and looks up the actual
+/// channel from the thread-local pool installed by [`ProcessorContext::deserialize`].
 pub struct Reader {
     channel: *const RdfcChannel,
 }
@@ -119,16 +126,20 @@ unsafe impl Send for Reader {}
 unsafe impl Sync for Reader {}
 
 impl Reader {
+    /// The channel URI (as registered by the orchestrator).
+    pub fn channel_uri(&self) -> &str {
+        unsafe {
+            let bytes = std::slice::from_raw_parts((*self.channel).uri, (*self.channel).uri_len);
+            std::str::from_utf8_unchecked(bytes)
+        }
+    }
+
     /// Read the next message.  Returns `None` when the channel is closed.
     pub fn next_bytes(&self) -> Option<Vec<u8>> {
-        let mut data = RdfcData {
-            ptr: std::ptr::null_mut(),
-            len: 0,
-        };
+        let mut data = RdfcData { ptr: std::ptr::null_mut(), len: 0 };
         let rc = unsafe { ((*self.channel).read)((*self.channel).ctx, &mut data) };
         if rc == 0 {
-            let bytes =
-                unsafe { std::slice::from_raw_parts(data.ptr, data.len) }.to_vec();
+            let bytes = unsafe { std::slice::from_raw_parts(data.ptr, data.len) }.to_vec();
             unsafe { ((*self.channel).free_data)(data.ptr, data.len) };
             Some(bytes)
         } else {
@@ -138,8 +149,7 @@ impl Reader {
 
     /// Read the next message as a UTF-8 string.
     pub fn next_string(&self) -> Option<String> {
-        self.next_bytes()
-            .and_then(|b| String::from_utf8(b).ok())
+        self.next_bytes().and_then(|b| String::from_utf8(b).ok())
     }
 
     /// Iterate over all incoming bytes.
@@ -154,6 +164,8 @@ impl Reader {
 }
 
 /// Ergonomic writer backed by the FFI [`RdfcChannel`].
+///
+/// Implements [`serde::Deserialize`] the same way as [`Reader`].
 pub struct Writer {
     channel: *const RdfcChannel,
 }
@@ -162,15 +174,19 @@ unsafe impl Send for Writer {}
 unsafe impl Sync for Writer {}
 
 impl Writer {
+    /// The channel URI (as registered by the orchestrator).
+    pub fn channel_uri(&self) -> &str {
+        unsafe {
+            let bytes = std::slice::from_raw_parts((*self.channel).uri, (*self.channel).uri_len);
+            std::str::from_utf8_unchecked(bytes)
+        }
+    }
+
     /// Write bytes to the channel (blocks until acknowledged).
     pub fn write_bytes(&self, data: &[u8]) -> Result<(), String> {
         let rc =
             unsafe { ((*self.channel).write)((*self.channel).ctx, data.as_ptr(), data.len()) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(format!("write failed with code {rc}"))
-        }
+        if rc == 0 { Ok(()) } else { Err(format!("write failed with code {rc}")) }
     }
 
     /// Write a UTF-8 string to the channel.
@@ -184,11 +200,76 @@ impl Writer {
     }
 }
 
+// ── Thread-local channel pools (used during deserialization) ──────────────────
+
+// When `ProcessorContext::deserialize::<C>()` is called, the reader and writer
+// channels are temporarily moved into these thread-local pools keyed by channel
+// URI.  The custom `Deserialize` impls for `Reader` and `Writer` pop entries
+// from these pools by matching the `@id` found in the JSON-LD argument object.
+thread_local! {
+    static READER_POOL: RefCell<HashMap<String, Reader>> = RefCell::new(HashMap::new());
+    static WRITER_POOL: RefCell<HashMap<String, Writer>> = RefCell::new(HashMap::new());
+}
+
+// ── serde::Deserialize for Reader ─────────────────────────────────────────────
+
+impl<'de> serde::Deserialize<'de> for Reader {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        // The orchestrator sends channel references as JSON-LD objects:
+        // { "@type": "https://w3id.org/rdf-connect#Reader", "@id": "<channel-uri>" }
+        #[derive(serde::Deserialize)]
+        struct ChannelRef {
+            #[serde(rename = "@id")]
+            id: String,
+        }
+
+        let chan = ChannelRef::deserialize(deserializer)?;
+
+        READER_POOL.with(|pool| {
+            pool.borrow_mut().remove(&chan.id).ok_or_else(|| {
+                D::Error::custom(format!(
+                    "no reader registered for channel '{}' — \
+                     make sure to call ProcessorContext::deserialize()",
+                    chan.id
+                ))
+            })
+        })
+    }
+}
+
+// ── serde::Deserialize for Writer ─────────────────────────────────────────────
+
+impl<'de> serde::Deserialize<'de> for Writer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        #[derive(serde::Deserialize)]
+        struct ChannelRef {
+            #[serde(rename = "@id")]
+            id: String,
+        }
+
+        let chan = ChannelRef::deserialize(deserializer)?;
+
+        WRITER_POOL.with(|pool| {
+            pool.borrow_mut().remove(&chan.id).ok_or_else(|| {
+                D::Error::custom(format!(
+                    "no writer registered for channel '{}' — \
+                     make sure to call ProcessorContext::deserialize()",
+                    chan.id
+                ))
+            })
+        })
+    }
+}
+
 // ── ProcessorContext ──────────────────────────────────────────────────────────
 
 /// High-level view of the arguments passed to a processor.
 pub struct ProcessorContext {
-    /// Raw JSON args (with Reader/Writer references already stripped out).
+    /// Raw JSON args (full JSON-LD including Reader/Writer channel objects).
     pub args: serde_json::Value,
     readers: HashMap<String, Reader>,
     writers: HashMap<String, Writer>,
@@ -202,12 +283,10 @@ impl ProcessorContext {
     pub unsafe fn from_ffi(ffi_args: *const RdfcArgs) -> Self {
         let a = &*ffi_args;
 
-        // Parse JSON args
         let json_bytes = std::slice::from_raw_parts(a.args_json, a.args_json_len);
         let args: serde_json::Value =
             serde_json::from_slice(json_bytes).unwrap_or(serde_json::Value::Null);
 
-        // Build reader map
         let mut readers = HashMap::new();
         let reader_slice = std::slice::from_raw_parts(a.readers, a.n_readers);
         for nc in reader_slice {
@@ -216,7 +295,6 @@ impl ProcessorContext {
             readers.insert(name, Reader { channel: &nc.channel });
         }
 
-        // Build writer map
         let mut writers = HashMap::new();
         let writer_slice = std::slice::from_raw_parts(a.writers, a.n_writers);
         for nc in writer_slice {
@@ -225,32 +303,71 @@ impl ProcessorContext {
             writers.insert(name, Writer { channel: &nc.channel });
         }
 
-        ProcessorContext {
-            args,
-            readers,
-            writers,
-        }
+        ProcessorContext { args, readers, writers }
     }
 
-    /// Get a reader by field name.
+    /// Deserialize the processor's JSON-LD config into a typed struct `C`.
+    ///
+    /// Any `Reader` or `Writer` fields in `C` are automatically populated by
+    /// matching the `@id` URI in the JSON-LD against the channels passed by the
+    /// runner.  All other fields deserialize normally from the JSON.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use rdfc_processor_sdk::*;
+    /// # use serde::Deserialize;
+    /// #[derive(Deserialize)]
+    /// struct Config {
+    ///     reader: Reader,
+    ///     writer: Writer,
+    ///     label: Option<String>,
+    /// }
+    ///
+    /// fn run(mut ctx: ProcessorContext) -> Result<(), String> {
+    ///     let Config { reader, writer, label } = ctx.deserialize()?;
+    ///     // ...
+    /// #   Ok(())
+    /// }
+    /// ```
+    pub fn deserialize<C: serde::de::DeserializeOwned>(&mut self) -> Result<C, String> {
+        // Rekey channels by URI so the Deserialize impls can look them up by @id.
+        let reader_pool: HashMap<String, Reader> = self
+            .readers
+            .drain()
+            .map(|(_, r)| (r.channel_uri().to_string(), r))
+            .collect();
+        let writer_pool: HashMap<String, Writer> = self
+            .writers
+            .drain()
+            .map(|(_, w)| (w.channel_uri().to_string(), w))
+            .collect();
+
+        READER_POOL.with(|p| *p.borrow_mut() = reader_pool);
+        WRITER_POOL.with(|p| *p.borrow_mut() = writer_pool);
+
+        let result = serde_json::from_value::<C>(self.args.clone()).map_err(|e| e.to_string());
+
+        // Clean up any channels that weren't consumed (e.g. optional ones).
+        READER_POOL.with(|p| p.borrow_mut().clear());
+        WRITER_POOL.with(|p| p.borrow_mut().clear());
+
+        result
+    }
+
+    /// Get a reader by SHACL field name (lower-level alternative to `deserialize`).
     pub fn reader(&self, name: &str) -> Result<&Reader, String> {
-        self.readers
-            .get(name)
-            .ok_or_else(|| format!("No reader named '{name}'"))
+        self.readers.get(name).ok_or_else(|| format!("no reader named '{name}'"))
     }
 
-    /// Get a writer by field name.
+    /// Get a writer by SHACL field name (lower-level alternative to `deserialize`).
     pub fn writer(&self, name: &str) -> Result<&Writer, String> {
-        self.writers
-            .get(name)
-            .ok_or_else(|| format!("No writer named '{name}'"))
+        self.writers.get(name).ok_or_else(|| format!("no writer named '{name}'"))
     }
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
 /// Utilities for writing unit-tests against processor functions.
-/// Available in `cfg(test)` of the SDK itself, or as `pub` for processor crates.
 pub mod testing {
     use std::collections::VecDeque;
     use std::ffi::c_void;
@@ -294,23 +411,23 @@ pub mod testing {
         *state.closed.lock().unwrap() = true;
     }
 
-    unsafe extern "C" fn noop_read(_ctx: *mut c_void, _out: *mut RdfcData) -> i32 { 1 }
-    unsafe extern "C" fn noop_write(_ctx: *mut c_void, _ptr: *const u8, _len: usize) -> i32 { 0 }
-    unsafe extern "C" fn noop_close(_ctx: *mut c_void) {}
+    unsafe extern "C" fn noop_read(_: *mut c_void, _: *mut RdfcData) -> i32 { 1 }
+    unsafe extern "C" fn noop_write(_: *mut c_void, _: *const u8, _: usize) -> i32 { 0 }
+    unsafe extern "C" fn noop_close(_: *mut c_void) {}
     unsafe extern "C" fn mock_free_data(ptr: *mut u8, len: usize) {
         let _ = unsafe { Vec::from_raw_parts(ptr, len, len) };
     }
 
     /// A mock reader channel backed by an in-memory queue.
-    /// Returns the `Arc` handles so tests can inspect state after processing.
-    pub fn make_mock_reader(messages: Vec<Vec<u8>>) -> (Arc<MockReaderState>, RdfcChannel) {
-        let state = Arc::new(MockReaderState {
-            messages: Mutex::new(messages.into()),
-        });
+    ///
+    /// `uri` must match the `@id` used in the test args JSON when calling
+    /// [`ProcessorContext::deserialize`].
+    pub fn make_mock_reader(uri: &'static str, messages: Vec<Vec<u8>>) -> (Arc<MockReaderState>, RdfcChannel) {
+        let state = Arc::new(MockReaderState { messages: Mutex::new(messages.into()) });
         let raw = Arc::into_raw(Arc::clone(&state)) as *mut c_void;
         let channel = RdfcChannel {
-            uri: b"mock://reader\0".as_ptr(),
-            uri_len: 13,
+            uri: uri.as_ptr(),
+            uri_len: uri.len(),
             ctx: raw,
             read: mock_read,
             write: noop_write,
@@ -321,15 +438,18 @@ pub mod testing {
     }
 
     /// A mock writer channel that collects written bytes.
-    pub fn make_mock_writer() -> (Arc<MockWriterState>, RdfcChannel) {
+    ///
+    /// `uri` must match the `@id` used in the test args JSON when calling
+    /// [`ProcessorContext::deserialize`].
+    pub fn make_mock_writer(uri: &'static str) -> (Arc<MockWriterState>, RdfcChannel) {
         let state = Arc::new(MockWriterState {
             received: Mutex::new(Vec::new()),
             closed: Mutex::new(false),
         });
         let raw = Arc::into_raw(Arc::clone(&state)) as *mut c_void;
         let channel = RdfcChannel {
-            uri: b"mock://writer\0".as_ptr(),
-            uri_len: 13,
+            uri: uri.as_ptr(),
+            uri_len: uri.len(),
             ctx: raw,
             read: noop_read,
             write: mock_write,
@@ -339,16 +459,9 @@ pub mod testing {
         (state, channel)
     }
 
-    /// Build a single-reader + single-writer [`RdfcNamedChannel`] pair for testing.
-    pub fn make_named(
-        name: &'static str,
-        channel: RdfcChannel,
-    ) -> RdfcNamedChannel {
-        RdfcNamedChannel {
-            name: name.as_ptr(),
-            name_len: name.len(),
-            channel,
-        }
+    /// Build a [`RdfcNamedChannel`] for testing (wraps a channel with a field name).
+    pub fn make_named(name: &'static str, channel: RdfcChannel) -> RdfcNamedChannel {
+        RdfcNamedChannel { name: name.as_ptr(), name_len: name.len(), channel }
     }
 }
 
@@ -356,12 +469,19 @@ pub mod testing {
 
 /// Export a processor function as the standard `rdfc_run` FFI entry point.
 ///
-/// The function must have the signature:
-/// ```text
-/// fn my_fn(ctx: ProcessorContext) -> Result<(), String>
-/// ```
+/// The config type is deserialized automatically from the JSON-LD arguments
+/// supplied by the orchestrator. `Reader` and `Writer` fields are resolved
+/// from the channel map by their `@id`. Rust infers the config type from the
+/// function signature, so no explicit type annotation is needed.
 ///
-/// The crate must be compiled with `crate-type = ["cdylib"]`.
+/// ```ignore
+/// #[derive(serde::Deserialize)]
+/// struct Config { reader: Reader, writer: Writer }
+///
+/// fn my_processor(cfg: Config) -> Result<(), String> { … }
+///
+/// rdfc_export!(my_processor);
+/// ```
 #[macro_export]
 macro_rules! rdfc_export {
     ($run_fn:path) => {
@@ -374,8 +494,11 @@ macro_rules! rdfc_export {
             args: *const rdfc_processor_sdk::RdfcArgs,
         ) -> i32 {
             let result = std::panic::catch_unwind(|| {
-                let ctx = unsafe { rdfc_processor_sdk::ProcessorContext::from_ffi(args) };
-                $run_fn(ctx)
+                let mut ctx =
+                    unsafe { rdfc_processor_sdk::ProcessorContext::from_ffi(args) };
+                // T is inferred from $run_fn's parameter type.
+                let config = ctx.deserialize()?;
+                $run_fn(config)
             });
             match result {
                 Ok(Ok(())) => 0,

@@ -2,19 +2,15 @@
 
 use rdfc_processor_sdk::*;
 
-fn send_proc(ctx: ProcessorContext) -> Result<(), String> {
-    let writer = ctx.writer("writer")?;
+#[derive(Deserialize)]
+struct Config {
+    writer: Writer,
+    #[serde(default)]
+    msgs: Vec<String>,
+}
 
-    let messages: Vec<String> = match ctx.args.get("msgs") {
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        Some(serde_json::Value::String(s)) => vec![s.clone()],
-        _ => vec![],
-    };
-
-    for msg in &messages {
+fn send_proc(Config { writer, msgs }: Config) -> Result<(), String> {
+    for msg in &msgs {
         writer.write_string(msg)?;
     }
     writer.close();
@@ -28,23 +24,28 @@ rdfc_export!(send_proc);
 #[cfg(test)]
 mod tests {
     use rdfc_processor_sdk::testing::*;
-    use rdfc_processor_sdk::{ProcessorContext, RdfcArgs};
+    use rdfc_processor_sdk::RdfcArgs;
 
-    fn run_send(msgs_json: &[u8]) -> (Vec<Vec<u8>>, bool) {
-        let (writer_state, writer_ch) = make_mock_writer();
+    fn run_send(extra_json: &str) -> (Vec<Vec<u8>>, bool) {
+        let (writer_state, writer_ch) = make_mock_writer("mock://writer");
         let writer_nc = make_named("writer", writer_ch);
 
+        let args_json = format!(
+            r#"{{"writer":{{"@type":"https://w3id.org/rdf-connect#Writer","@id":"mock://writer"}},{}}}"#,
+            extra_json
+        );
+        let args_bytes = args_json.as_bytes().to_vec();
+
         let ffi_args = RdfcArgs {
-            args_json: msgs_json.as_ptr(),
-            args_json_len: msgs_json.len(),
+            args_json: args_bytes.as_ptr(),
+            args_json_len: args_bytes.len(),
             readers: std::ptr::NonNull::dangling().as_ptr(),
             n_readers: 0,
             writers: &writer_nc,
             n_writers: 1,
         };
 
-        let ctx = unsafe { ProcessorContext::from_ffi(&ffi_args) };
-        super::send_proc(ctx).unwrap();
+        assert_eq!(unsafe { super::rdfc_run(&ffi_args) }, 0);
 
         let received = writer_state.received.lock().unwrap().clone();
         let closed = *writer_state.closed.lock().unwrap();
@@ -53,22 +54,16 @@ mod tests {
 
     #[test]
     fn send_emits_array_messages() {
-        let (received, closed) = run_send(br#"{"msgs":["alpha","beta","gamma"]}"#);
+        let (received, closed) = run_send(r#""msgs":["alpha","beta","gamma"]"#);
         assert_eq!(received, vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
         assert!(closed);
     }
 
     #[test]
-    fn send_emits_single_string() {
-        let (received, closed) = run_send(br#"{"msgs":"hello"}"#);
-        assert_eq!(received, vec![b"hello".to_vec()]);
-        assert!(closed);
-    }
-
-    #[test]
     fn send_no_messages_closes_writer() {
-        let (received, closed) = run_send(br#"{}"#);
+        let (received, closed) = run_send(r#""msgs":[]"#);
         assert!(received.is_empty());
         assert!(closed);
     }
 }
+

@@ -2,15 +2,14 @@
 
 use rdfc_processor_sdk::*;
 
-fn log_proc(ctx: ProcessorContext) -> Result<(), String> {
-    let reader = ctx.reader("reader")?;
-    let label = ctx
-        .args
-        .get("label")
-        .and_then(|v| v.as_str())
-        .unwrap_or("log")
-        .to_string();
+#[derive(Deserialize)]
+struct Config {
+    reader: Reader,
+    label: Option<String>,
+}
 
+fn log_proc(Config { reader, label }: Config) -> Result<(), String> {
+    let label = label.unwrap_or_else(|| "log".to_string());
     for bytes in reader.iter_bytes() {
         match std::str::from_utf8(&bytes) {
             Ok(s) => eprintln!("[{label}] {s}"),
@@ -27,18 +26,21 @@ rdfc_export!(log_proc);
 #[cfg(test)]
 mod tests {
     use rdfc_processor_sdk::testing::*;
-    use rdfc_processor_sdk::{ProcessorContext, RdfcArgs};
+    use rdfc_processor_sdk::RdfcArgs;
 
     #[test]
     fn log_consumes_all_messages() {
-        let (_, reader_ch) = make_mock_reader(vec![
+        let (_, reader_ch) = make_mock_reader("mock://reader", vec![
             b"hello".to_vec(),
             b"world".to_vec(),
         ]);
-
         let reader_nc = make_named("reader", reader_ch);
 
-        let args_json = br#"{"label":"test"}"#;
+        let args_json = br#"{
+            "reader": {"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"},
+            "label": "test"
+        }"#;
+
         let empty: Vec<rdfc_processor_sdk::RdfcNamedChannel> = vec![];
         let ffi_args = RdfcArgs {
             args_json: args_json.as_ptr(),
@@ -49,8 +51,7 @@ mod tests {
             n_writers: 0,
         };
 
-        let ctx = unsafe { ProcessorContext::from_ffi(&ffi_args) };
-        // should complete without error
-        super::log_proc(ctx).unwrap();
+        assert_eq!(unsafe { super::rdfc_run(&ffi_args) }, 0);
     }
 }
+

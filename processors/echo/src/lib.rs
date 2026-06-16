@@ -2,9 +2,13 @@
 
 use rdfc_processor_sdk::*;
 
-fn echo(ctx: ProcessorContext) -> Result<(), String> {
-    let reader = ctx.reader("reader")?;
-    let writer = ctx.writer("writer")?;
+#[derive(Deserialize)]
+struct Config {
+    reader: Reader,
+    writer: Writer,
+}
+
+fn echo(Config { reader, writer }: Config) -> Result<(), String> {
     for bytes in reader.iter_bytes() {
         writer.write_bytes(&bytes)?;
     }
@@ -19,60 +23,41 @@ rdfc_export!(echo);
 #[cfg(test)]
 mod tests {
     use rdfc_processor_sdk::testing::*;
-    use rdfc_processor_sdk::{ProcessorContext, RdfcArgs};
+    use rdfc_processor_sdk::RdfcArgs;
+
+    const ARGS: &[u8] = br#"{
+        "reader": {"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"},
+        "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"}
+    }"#;
 
     #[test]
     fn echo_forwards_all_messages() {
-        let (_, reader_ch) = make_mock_reader(vec![
-            b"hello".to_vec(),
-            b"world".to_vec(),
-        ]);
-        let (writer_state, writer_ch) = make_mock_writer();
-
+        let (_, reader_ch) = make_mock_reader("mock://reader", vec![b"hello".to_vec(), b"world".to_vec()]);
+        let (writer_state, writer_ch) = make_mock_writer("mock://writer");
         let reader_nc = make_named("reader", reader_ch);
         let writer_nc = make_named("writer", writer_ch);
-
-        let args_json = b"{}";
         let ffi_args = RdfcArgs {
-            args_json: args_json.as_ptr(),
-            args_json_len: args_json.len(),
-            readers: &reader_nc,
-            n_readers: 1,
-            writers: &writer_nc,
-            n_writers: 1,
+            args_json: ARGS.as_ptr(), args_json_len: ARGS.len(),
+            readers: &reader_nc, n_readers: 1,
+            writers: &writer_nc, n_writers: 1,
         };
-
-        let ctx = unsafe { ProcessorContext::from_ffi(&ffi_args) };
-        super::echo(ctx).unwrap();
-
-        let received = writer_state.received.lock().unwrap();
-        assert_eq!(received.len(), 2);
-        assert_eq!(received[0], b"hello");
-        assert_eq!(received[1], b"world");
+        assert_eq!(unsafe { super::rdfc_run(&ffi_args) }, 0);
+        assert_eq!(*writer_state.received.lock().unwrap(), vec![b"hello".to_vec(), b"world".to_vec()]);
         assert!(*writer_state.closed.lock().unwrap());
     }
 
     #[test]
     fn echo_empty_stream_closes_writer() {
-        let (_, reader_ch) = make_mock_reader(vec![]);
-        let (writer_state, writer_ch) = make_mock_writer();
-
+        let (_, reader_ch) = make_mock_reader("mock://reader", vec![]);
+        let (writer_state, writer_ch) = make_mock_writer("mock://writer");
         let reader_nc = make_named("reader", reader_ch);
         let writer_nc = make_named("writer", writer_ch);
-
-        let args_json = b"{}";
         let ffi_args = RdfcArgs {
-            args_json: args_json.as_ptr(),
-            args_json_len: args_json.len(),
-            readers: &reader_nc,
-            n_readers: 1,
-            writers: &writer_nc,
-            n_writers: 1,
+            args_json: ARGS.as_ptr(), args_json_len: ARGS.len(),
+            readers: &reader_nc, n_readers: 1,
+            writers: &writer_nc, n_writers: 1,
         };
-
-        let ctx = unsafe { ProcessorContext::from_ffi(&ffi_args) };
-        super::echo(ctx).unwrap();
-
+        assert_eq!(unsafe { super::rdfc_run(&ffi_args) }, 0);
         assert!(writer_state.received.lock().unwrap().is_empty());
         assert!(*writer_state.closed.lock().unwrap());
     }
