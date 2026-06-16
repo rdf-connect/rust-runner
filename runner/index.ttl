@@ -1,0 +1,114 @@
+@prefix rdfc: <https://w3id.org/rdf-connect#>.
+@prefix sh: <http://www.w3.org/ns/shacl#>.
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#>.
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
+@prefix : <https://w3id.org/rdf-connect/rust#>.
+
+# ── Runner definition ─────────────────────────────────────────────────────────
+rdfc:RustRunner a rdfc:Runner;
+  rdfc:handlesSubjectsOf :rustImplementationOf;
+  rdfc:command "rust-runner".
+
+# ── Shape: what the runner expects per processor definition ──────────────────
+# Extracted from proc.config JSON-LD by the orchestrator.
+[ ] a sh:NodeShape;
+  sh:targetSubjectsOf :rustImplementationOf;
+  sh:property [
+    sh:path rdfc:file;
+    sh:name "file";
+    sh:minCount 1;
+    sh:maxCount 1;
+    sh:datatype xsd:anyURI;
+    sh:description "Path to a .so/.dylib, a Cargo project directory, or 'builtin://<name>'.";
+  ], [
+    sh:path rdfc:type;
+    sh:name "type";
+    sh:maxCount 1;
+    sh:datatype xsd:string;
+    sh:description "Optional type name within the shared library (unused for builtins).";
+  ].
+
+# ── Built-in processor: EchoProcessor ────────────────────────────────────────
+rdfc:EchoProcessor :rustImplementationOf rdfc:Processor;
+  rdfc:file <builtin://echo>.
+
+[ ] a sh:NodeShape;
+  sh:targetClass rdfc:EchoProcessor;
+  sh:property [
+    sh:path rdfc:reader;
+    sh:name "reader";
+    sh:class rdfc:Reader;
+    sh:minCount 1;
+    sh:maxCount 1;
+  ], [
+    sh:path rdfc:writer;
+    sh:name "writer";
+    sh:class rdfc:Writer;
+    sh:minCount 1;
+    sh:maxCount 1;
+  ].
+
+# ── Built-in processor: LogProcessor ─────────────────────────────────────────
+rdfc:LogProcessor :rustImplementationOf rdfc:Processor;
+  rdfc:file <builtin://log>.
+
+[ ] a sh:NodeShape;
+  sh:targetClass rdfc:LogProcessor;
+  sh:property [
+    sh:path rdfc:reader;
+    sh:name "reader";
+    sh:class rdfc:Reader;
+    sh:minCount 1;
+    sh:maxCount 1;
+  ], [
+    sh:path rdfc:label;
+    sh:name "label";
+    sh:maxCount 1;
+    sh:datatype xsd:string;
+  ].
+
+# ── Built-in processor: SendProcessor ────────────────────────────────────────
+rdfc:SendProcessor :rustImplementationOf rdfc:Processor;
+  rdfc:file <builtin://send>.
+
+[ ] a sh:NodeShape;
+  sh:targetClass rdfc:SendProcessor;
+  sh:property [
+    sh:path rdfc:writer;
+    sh:name "writer";
+    sh:class rdfc:Writer;
+    sh:minCount 1;
+    sh:maxCount 1;
+  ], [
+    sh:path rdfc:msg;
+    sh:name "msgs";
+    sh:datatype xsd:string;
+  ].
+
+# ── Example pipeline using only Rust processors ───────────────────────────────
+# 
+# @prefix owl: <http://www.w3.org/2002/07/owl#>.
+# @prefix rdfc: <https://w3id.org/rdf-connect#>.
+# 
+# <> owl:imports <https://w3id.org/rdf-connect/rust/index.ttl>.
+# 
+<> a rdfc:Pipeline;
+  rdfc:consistsOf [
+    rdfc:instantiates rdfc:RustRunner;
+    rdfc:processor <sender>, <echo>, <log>;
+  ].
+
+<ch1> a rdfc:Writer, rdfc:Reader .
+<ch2> a rdfc:Writer, rdfc:Reader .
+
+<sender> a rdfc:SendProcessor ;
+    rdfc:writer <ch1> ;
+    rdfc:msg "hello", "world" .
+
+<echo> a rdfc:EchoProcessor ;
+    rdfc:reader <ch1> ;
+    rdfc:writer <ch2> .
+
+<log> a rdfc:LogProcessor ;
+    rdfc:reader <ch2> .
+

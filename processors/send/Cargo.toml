@@ -1,0 +1,11 @@
+[package]
+name = "rdfc-processor-send"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rdfc-processor-sdk = { path = "../../processor-sdk" }
+serde_json = "1"

@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package rdfc;
+
+message Error { string cause = 1; }
+
+message Close { string channel = 1; }
+
+// Central piece of data
+message DataChunk { bytes data = 1; }
+
+// This message contains data that is sent from a runner to the orchestrator
+message SendingMessage {
+  uint32 localSequenceNumber = 1;
+  string channel = 2;
+  bytes data = 3;
+}
+
+// This message contains data that is received by a runner from the orchestrator
+message ReceivingMessage {
+  uint32 globalSequenceNumber = 1;
+  string channel = 2;
+  bytes data = 3;
+}
+
+// StreamMessage contains the sequenceNumber used to receive the streaming data
+// This message is received by the runner from the orchestrator
+message ReceivingStreamMessage {
+  uint32 globalSequenceNumber = 1;
+  string channel = 2;
+}
+
+// Control message for a streaming message, to the producer
+// When the runner receives 0 it can send the first chunk
+// After each chunk it MUST await the next sequenceNumber
+message ReceivingStreamControl { uint32 streamSequenceNumber = 2; }
+
+// Control message for a streaming message, from the consumer
+// First the consumer must identify which stream it wants to consume, with the
+// globalSequenceNumber
+// Then after handling a chunk, it must send how many chunks have been handled
+message SendingStreamControl {
+  oneof inner {
+    uint32 globalSequenceNumber = 1;
+    uint32 streamSequenceNumber = 2;
+  }
+}
+
+// The first message when a runner sends a streaming message to the orchestrator
+message StreamIdentify {
+  uint32 localSequenceNumber = 1;
+  string channel = 2;
+  string runner = 3;
+}
+
+// Wrapper around first StreamIdentify to identify the sendingStreamMessage
+// And the data that is part of the streaming message
+message StreamChunk {
+  oneof inner {
+    StreamIdentify id = 1;
+    DataChunk data = 2;
+  }
+}
+
+// The processing runner acknowledges that the full message has been handled
+message GlobalAck {
+  uint32 globalSequenceNumber = 1;
+  string channel = 2;
+  optional string error = 3;
+}
+
+// The producings runner is allowed to send a new message.
+// The consuming runner is finished
+message LocalAck {
+  uint32 localSequenceNumber = 1;
+  string channel = 2;
+  optional string error = 3;
+}

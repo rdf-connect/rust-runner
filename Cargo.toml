@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "processor-sdk",
+    "runner",
+    "processors/echo",
+    "processors/log",
+    "processors/send",
+]
+resolver = "2"

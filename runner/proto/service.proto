@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package rdfc;
+
+import "google/protobuf/empty.proto";
+
+import "common.proto";
+
+message LogMessage {
+  string level = 1;
+  string msg = 2;
+  repeated string entities = 3;
+  repeated string aliases = 4;
+}
+
+message Processor {
+  /* The URI of the Processor. */
+  string uri = 1;
+  /* The processor configuration, in JSON-LD */
+  string config = 2;
+  /* Processor arguments, in JSON-LD */
+  string arguments = 3;
+}
+
+message ToRunner {
+  oneof inner {
+    Processor proc = 1;
+    google.protobuf.Empty start = 2;
+    ReceivingMessage msg = 3;
+    Close close = 4;
+    ReceivingStreamMessage streamMsg = 5;
+    /* The full pipeline in Turtle including all SHACL shapes and found
+     * information */
+    string pipeline = 6;
+
+    LocalAck processed = 7;
+  }
+}
+
+// Tells the orchestrator that the processor is initialized
+message ProcessorInitialized {
+  /* The URI of the Processor. */
+  string uri = 1;
+  optional Error error = 2;
+}
+
+message RunnerIdentify { string uri = 1; }
+
+message FromRunner {
+  oneof inner {
+    ProcessorInitialized initialized = 1;
+    Close close = 2;
+    RunnerIdentify identify = 3;
+    SendingMessage msg = 4;
+    GlobalAck processed = 5;
+  }
+}
+
+service Runner {
+  rpc connect(stream FromRunner) returns (stream ToRunner);
+  rpc sendStreamMessage(stream StreamChunk)
+      returns (stream ReceivingStreamControl);
+  rpc receiveStreamMessage(stream SendingStreamControl)
+      returns (stream DataChunk);
+  rpc logStream(stream LogMessage) returns (google.protobuf.Empty);
+}
