@@ -1,6 +1,6 @@
 //! Echo processor — forwards every message from `reader` to `writer`.
 
-use rdfc_processor_sdk::*;
+use rdfc_processor_sdk::{futures::StreamExt, *};
 
 #[derive(Deserialize)]
 struct Config {
@@ -8,9 +8,10 @@ struct Config {
     writer: Writer,
 }
 
-fn echo(Config { reader, writer }: Config) -> Result<(), String> {
-    for bytes in reader.iter_bytes() {
-        writer.write_bytes(&bytes)?;
+async fn echo(Config { reader, writer }: Config) -> Result<(), String> {
+    let mut stream = reader.into_stream();
+    while let Some(bytes) = stream.next().await {
+        writer.write(&bytes).await?;
     }
     writer.close();
     Ok(())

@@ -9,9 +9,9 @@ struct Config {
     msgs: Vec<String>,
 }
 
-fn send_proc(Config { writer, msgs }: Config) -> Result<(), String> {
+async fn send_proc(Config { writer, msgs }: Config) -> Result<(), String> {
     for msg in &msgs {
-        writer.write_string(msg)?;
+        writer.write_str(msg).await?;
     }
     writer.close();
     Ok(())

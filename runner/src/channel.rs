@@ -21,9 +21,10 @@ pub(crate) enum ReaderMsg {
 
 // ── Shared registries (owned by RunnerState, shared with channel instances) ──
 
-/// channel_uri → sender used by the runner to push incoming messages.
+/// channel_uri → list of senders used by the runner to push incoming messages.
+/// A Vec supports fan-out: multiple processors may read from the same channel.
 pub(crate) type ReaderRegistry =
-    Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ReaderMsg>>>>;
+    Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<ReaderMsg>>>>>;
 
 /// (channel_uri, local_seq) → oneshot ack for each pending write.
 pub(crate) type WriterAckRegistry =

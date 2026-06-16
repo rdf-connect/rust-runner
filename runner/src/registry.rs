@@ -130,7 +130,7 @@ impl ProcessorRegistry {
         // Extend lifetime — the Library is kept alive in `loaded_libs`.
         let run_fn: RunFn = unsafe { std::mem::transmute(run_fn.into_raw()) };
 
-        self.loaded_libs.insert(so_path, lib);
+        self.loaded_libs.entry(so_path).or_insert(lib);
 
         Ok(Box::new(DynamicProcessor::new(run_fn, ctx)))
     }

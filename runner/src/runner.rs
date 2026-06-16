@@ -159,9 +159,18 @@ impl RunnerState {
 
             Some(ToRunnerInner::StreamMsg(sm)) => {
                 warn!(
-                    "streaming messages not yet implemented (channel '{}')",
+                    "streaming messages not yet implemented (channel '{}'), sending GlobalAck",
                     sm.channel
                 );
+                // Send GlobalAck so the orchestrator's flow-control doesn't stall.
+                use crate::proto::rdfc::{from_runner::Inner as FRI, GlobalAck};
+                let _ = self.orch_tx.send(crate::proto::rdfc::FromRunner {
+                    inner: Some(FRI::Processed(GlobalAck {
+                        global_sequence_number: sm.global_sequence_number,
+                        channel: sm.channel,
+                        error: Some("streaming not implemented".to_string()),
+                    })),
+                });
             }
 
             Some(ToRunnerInner::Close(c)) => {
@@ -186,6 +195,15 @@ impl RunnerState {
     // ── Processor setup ───────────────────────────────────────────────────────
 
     async fn handle_proc(&mut self, proc_msg: crate::proto::rdfc::Processor) -> Result<()> {
+        let uri = proc_msg.uri.clone();
+        let result = self.try_setup_proc(proc_msg).await;
+        if let Err(ref e) = result {
+            self.send_initialized(&uri, Some(e.to_string()));
+        }
+        result
+    }
+
+    async fn try_setup_proc(&mut self, proc_msg: crate::proto::rdfc::Processor) -> Result<()> {
         let uri = proc_msg.uri.clone();
         info!("setting up processor '{uri}'");
 
@@ -279,7 +297,9 @@ impl RunnerState {
         self.reader_registry
             .lock()
             .unwrap()
-            .insert(channel_uri.clone(), tx);
+            .entry(channel_uri.clone())
+            .or_insert_with(Vec::new)
+            .push(tx);
         Reader::new(channel_uri, rx, self.orch_tx.clone())
     }
 
@@ -293,16 +313,20 @@ impl RunnerState {
 
     fn dispatch_msg(&self, channel: String, data: Bytes, global_seq: u32) {
         debug!(channel = %channel, seq = global_seq, "dispatching message");
-        if let Some(tx) = self.reader_registry.lock().unwrap().get(&channel) {
-            let _ = tx.send(ReaderMsg::Data(data, global_seq));
+        if let Some(senders) = self.reader_registry.lock().unwrap().get(&channel) {
+            for tx in senders {
+                let _ = tx.send(ReaderMsg::Data(data.clone(), global_seq));
+            }
         } else {
             warn!("no reader for channel '{channel}'");
         }
     }
 
     fn close_reader(&self, channel: &str) {
-        if let Some(tx) = self.reader_registry.lock().unwrap().get(channel) {
-            let _ = tx.send(ReaderMsg::Close);
+        if let Some(senders) = self.reader_registry.lock().unwrap().get(channel) {
+            for tx in senders {
+                let _ = tx.send(ReaderMsg::Close);
+            }
         }
     }
 

@@ -9,16 +9,15 @@
 //!
 //! ```rust,no_run
 //! use rdfc_processor_sdk::*;
+//! use futures::StreamExt;
 //!
 //! #[derive(Deserialize)]
-//! struct Config {
-//!     reader: Reader,
-//!     writer: Writer,
-//! }
+//! struct Config { reader: Reader, writer: Writer }
 //!
-//! fn my_processor(Config { reader, writer }: Config) -> Result<(), String> {
-//!     for bytes in reader.iter_bytes() {
-//!         writer.write_bytes(&bytes)?;
+//! async fn my_processor(Config { reader, writer }: Config) -> Result<(), String> {
+//!     let mut stream = reader.into_stream();
+//!     while let Some(bytes) = stream.next().await {
+//!         writer.write(&bytes).await?;
 //!     }
 //!     writer.close();
 //!     Ok(())
@@ -32,6 +31,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 pub use serde::Deserialize;
+pub use tokio;
+pub use futures;
 
 // ── FFI primitives ────────────────────────────────────────────────────────────
 
@@ -134,32 +135,47 @@ impl Reader {
         }
     }
 
-    /// Read the next message.  Returns `None` when the channel is closed.
-    pub fn next_bytes(&self) -> Option<Vec<u8>> {
-        let mut data = RdfcData { ptr: std::ptr::null_mut(), len: 0 };
-        let rc = unsafe { ((*self.channel).read)((*self.channel).ctx, &mut data) };
-        if rc == 0 {
-            let bytes = unsafe { std::slice::from_raw_parts(data.ptr, data.len) }.to_vec();
-            unsafe { ((*self.channel).free_data)(data.ptr, data.len) };
-            Some(bytes)
-        } else {
-            None
-        }
+    /// Receive the next message from the channel.
+    ///
+    /// Returns `None` when the channel is closed (no more messages).
+    /// Internally runs the blocking FFI call on a `spawn_blocking` thread so
+    /// the async runtime remains unblocked.
+    pub async fn read(&mut self) -> Option<Vec<u8>> {
+        let ptr = self.channel as usize;
+        tokio::task::spawn_blocking(move || {
+            let ch = ptr as *const RdfcChannel;
+            let mut data = RdfcData { ptr: std::ptr::null_mut(), len: 0 };
+            let rc = unsafe { ((*ch).read)((*ch).ctx, &mut data) };
+            if rc == 0 {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(data.ptr, data.len) }.to_vec();
+                unsafe { ((*ch).free_data)(data.ptr, data.len) };
+                Some(bytes)
+            } else {
+                if rc < 0 {
+                    eprintln!("[rdfc] reader FFI error (rc={rc}), treating as EOF");
+                }
+                None
+            }
+        })
+        .await
+        .expect("reader spawn_blocking")
     }
 
-    /// Read the next message as a UTF-8 string.
-    pub fn next_string(&self) -> Option<String> {
-        self.next_bytes().and_then(|b| String::from_utf8(b).ok())
-    }
-
-    /// Iterate over all incoming bytes.
-    pub fn iter_bytes(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
-        std::iter::from_fn(move || self.next_bytes())
-    }
-
-    /// Iterate over all incoming strings.
-    pub fn iter_strings(&self) -> impl Iterator<Item = String> + '_ {
-        std::iter::from_fn(move || self.next_string())
+    /// Consume the reader as an async `Stream` of byte messages.
+    ///
+    /// ```ignore
+    /// use futures::StreamExt;
+    ///
+    /// let mut stream = reader.into_stream();
+    /// while let Some(bytes) = stream.next().await { … }
+    /// ```
+    pub fn into_stream(
+        self,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Vec<u8>> + Send>> {
+        Box::pin(futures::stream::unfold(self, |mut reader| async {
+            reader.read().await.map(|bytes| (bytes, reader))
+        }))
     }
 }
 
@@ -168,6 +184,7 @@ impl Reader {
 /// Implements [`serde::Deserialize`] the same way as [`Reader`].
 pub struct Writer {
     channel: *const RdfcChannel,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for Writer {}
@@ -182,21 +199,37 @@ impl Writer {
         }
     }
 
-    /// Write bytes to the channel (blocks until acknowledged).
-    pub fn write_bytes(&self, data: &[u8]) -> Result<(), String> {
-        let rc =
-            unsafe { ((*self.channel).write)((*self.channel).ctx, data.as_ptr(), data.len()) };
-        if rc == 0 { Ok(()) } else { Err(format!("write failed with code {rc}")) }
+    /// Send bytes to the channel.
+    ///
+    /// Internally runs the blocking FFI call on a `spawn_blocking` thread.
+    pub async fn write(&self, data: &[u8]) -> Result<(), String> {
+        let ptr = self.channel as usize;
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let ch = ptr as *const RdfcChannel;
+            let rc = unsafe { ((*ch).write)((*ch).ctx, data.as_ptr(), data.len()) };
+            if rc == 0 { Ok(()) } else { Err(format!("write failed with code {rc}")) }
+        })
+        .await
+        .expect("writer spawn_blocking")
     }
 
-    /// Write a UTF-8 string to the channel.
-    pub fn write_string(&self, s: &str) -> Result<(), String> {
-        self.write_bytes(s.as_bytes())
+    /// Send a UTF-8 string to the channel.
+    pub async fn write_str(&self, s: &str) -> Result<(), String> {
+        self.write(s.as_bytes()).await
     }
 
-    /// Signal that no more data will be written.
+    /// Signal that no more data will be written to this channel.
     pub fn close(&self) {
-        unsafe { ((*self.channel).close)((*self.channel).ctx) }
+        if !self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            unsafe { ((*self.channel).close)((*self.channel).ctx) }
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -300,7 +333,7 @@ impl ProcessorContext {
         for nc in writer_slice {
             let name_bytes = std::slice::from_raw_parts(nc.name, nc.name_len);
             let name = String::from_utf8_lossy(name_bytes).into_owned();
-            writers.insert(name, Writer { channel: &nc.channel });
+            writers.insert(name, Writer { channel: &nc.channel, closed: std::sync::atomic::AtomicBool::new(false) });
         }
 
         ProcessorContext { args, readers, writers }
@@ -469,16 +502,20 @@ pub mod testing {
 
 /// Export a processor function as the standard `rdfc_run` FFI entry point.
 ///
-/// The config type is deserialized automatically from the JSON-LD arguments
-/// supplied by the orchestrator. `Reader` and `Writer` fields are resolved
-/// from the channel map by their `@id`. Rust infers the config type from the
-/// function signature, so no explicit type annotation is needed.
+/// Works for both sync and async processor functions — Rust infers the config
+/// type from the function signature.
 ///
 /// ```ignore
-/// #[derive(serde::Deserialize)]
+/// use rdfc_processor_sdk::*;
+///
+/// #[derive(Deserialize)]
 /// struct Config { reader: Reader, writer: Writer }
 ///
+/// // sync
 /// fn my_processor(cfg: Config) -> Result<(), String> { … }
+///
+/// // or async
+/// async fn my_processor(cfg: Config) -> Result<(), String> { … }
 ///
 /// rdfc_export!(my_processor);
 /// ```
@@ -496,9 +533,13 @@ macro_rules! rdfc_export {
             let result = std::panic::catch_unwind(|| {
                 let mut ctx =
                     unsafe { rdfc_processor_sdk::ProcessorContext::from_ffi(args) };
-                // T is inferred from $run_fn's parameter type.
+                // T inferred from $run_fn's parameter type; block_on drives the async fn.
                 let config = ctx.deserialize()?;
-                $run_fn(config)
+                rdfc_processor_sdk::tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime")
+                    .block_on($run_fn(config))
             });
             match result {
                 Ok(Ok(())) => 0,

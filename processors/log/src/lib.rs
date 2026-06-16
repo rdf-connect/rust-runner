@@ -1,6 +1,6 @@
 //! Log processor — prints every incoming message to stderr.
 
-use rdfc_processor_sdk::*;
+use rdfc_processor_sdk::{futures::StreamExt, *};
 
 #[derive(Deserialize)]
 struct Config {
@@ -8,9 +8,10 @@ struct Config {
     label: Option<String>,
 }
 
-fn log_proc(Config { reader, label }: Config) -> Result<(), String> {
+async fn log_proc(Config { reader, label }: Config) -> Result<(), String> {
     let label = label.unwrap_or_else(|| "log".to_string());
-    for bytes in reader.iter_bytes() {
+    let mut stream = reader.into_stream();
+    while let Some(bytes) = stream.next().await {
         match std::str::from_utf8(&bytes) {
             Ok(s) => eprintln!("[{label}] {s}"),
             Err(_) => eprintln!("[{label}] <{} bytes>", bytes.len()),
