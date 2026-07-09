@@ -81,11 +81,6 @@ impl Reader {
         }
     }
 
-    pub(crate) fn close(&mut self) {
-        // Drain pending item if any and stop delivering
-        while self.rx.try_recv().is_ok() {}
-    }
-
     fn send_global_ack(&self, global_seq: u32, error: Option<String>) {
         let msg = FromRunner {
             inner: Some(FromRunnerInner::Processed(GlobalAck {
@@ -216,138 +211,59 @@ impl Writer {
     }
 }
 
-// ── FFI adapter (bridges Runner channels to the SDK's C ABI) ─────────────────
+// ── SDK bridge functions ──────────────────────────────────────────────────────
 
-use rdfc_processor_sdk::{RdfcChannel, RdfcData};
-use std::ffi::c_void;
-
-/// Heap-allocated state for a reader channel exposed over FFI.
-struct FfiReaderState {
-    // We move the Reader into the heap so we can keep a raw pointer to it.
-    reader: Reader,
-}
-
-unsafe extern "C" fn ffi_read(ctx: *mut c_void, out: *mut RdfcData) -> i32 {
-    let state = &mut *(ctx as *mut FfiReaderState);
-    match state.reader.blocking_recv() {
-        Some(bytes) => {
-            let boxed = bytes.to_vec().into_boxed_slice();
-            let ptr = boxed.as_ptr() as *mut u8;
-            let len = boxed.len();
-            std::mem::forget(boxed);
-            (*out).ptr = ptr;
-            (*out).len = len;
-            0
+/// Wrap a runner [`Reader`] as an FFI-safe [`rdfc_processor_sdk::BoxedRawReader`],
+/// ready to cross into a processor `cdylib`.
+///
+/// Spawns a background task that forwards messages from the runner channel
+/// (gRPC-backed) into the raw channel the processor will read from.
+pub(crate) fn bridge_reader(runner_reader: Reader) -> rdfc_processor_sdk::BoxedRawReader {
+    let uri = runner_reader.channel_uri().to_string();
+    let (sdk_reader, bridge) = rdfc_processor_sdk::make_reader(uri);
+    tokio::spawn(async move {
+        let mut r = runner_reader;
+        loop {
+            match r.recv().await {
+                Some(data) => {
+                    if bridge.send(data).is_err() {
+                        break;
+                    }
+                }
+                None => {
+                    bridge.close();
+                    break;
+                }
+            }
         }
-        None => 1, // closed
-    }
+    });
+    sdk_reader.into_raw()
 }
 
-unsafe extern "C" fn ffi_read_write(_ctx: *mut c_void, _ptr: *const u8, _len: usize) -> i32 {
-    // Readers don't support writes — should never be called.
-    -1
-}
-
-unsafe extern "C" fn ffi_reader_close(ctx: *mut c_void) {
-    let state = &mut *(ctx as *mut FfiReaderState);
-    state.reader.close();
-}
-
-unsafe extern "C" fn ffi_free_data(ptr: *mut u8, len: usize) {
-    // Re-construct the Box so it gets properly deallocated.
-    let _ = Vec::from_raw_parts(ptr, len, len);
-}
-
-/// Heap-allocated state for a writer channel exposed over FFI.
-struct FfiWriterState {
-    writer: Writer,
-}
-
-unsafe extern "C" fn ffi_write_noop(_ctx: *mut c_void, _out: *mut RdfcData) -> i32 {
-    -1 // Writers don't support reads.
-}
-
-unsafe extern "C" fn ffi_write(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
-    let state = &mut *(ctx as *mut FfiWriterState);
-    let data = std::slice::from_raw_parts(ptr, len);
-    match state.writer.write_blocking(data) {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
-}
-
-unsafe extern "C" fn ffi_writer_close(ctx: *mut c_void) {
-    let state = &mut *(ctx as *mut FfiWriterState);
-    state.writer.close();
-}
-
-unsafe extern "C" fn ffi_writer_free(_ptr: *mut u8, _len: usize) {
-    // Writers never allocate read buffers.
-}
-
-/// Wrap a `Reader` as an [`RdfcChannel`] for the SDK.
+/// Wrap a runner [`Writer`] as an FFI-safe [`rdfc_processor_sdk::BoxedRawWriter`],
+/// ready to cross into a processor `cdylib`.
 ///
-/// The returned channel's `ctx` owns a `Box<FfiReaderState>` that must be freed
-/// by calling `drop_ffi_reader_channel` when done.
-pub(crate) fn make_ffi_reader_channel(uri: String, reader: Reader) -> RdfcChannel {
-    let uri_bytes = uri.into_bytes().into_boxed_slice();
-    let uri_ptr = uri_bytes.as_ptr();
-    let uri_len = uri_bytes.len();
-    std::mem::forget(uri_bytes);
-
-    let state = Box::new(FfiReaderState { reader });
-    let ctx = Box::into_raw(state) as *mut c_void;
-
-    RdfcChannel {
-        uri: uri_ptr,
-        uri_len,
-        ctx,
-        read: ffi_read,
-        write: ffi_read_write,
-        close: ffi_reader_close,
-        free_data: ffi_free_data,
-    }
-}
-
-/// Free all resources owned by an FFI reader channel created by [`make_ffi_reader_channel`].
-///
-/// # Safety
-/// `ch` must have been produced by `make_ffi_reader_channel` and not yet freed.
-pub(crate) unsafe fn drop_ffi_reader_channel(ch: RdfcChannel) {
-    let _ = Box::from_raw(ch.ctx as *mut FfiReaderState);
-    let uri_bytes = std::slice::from_raw_parts_mut(ch.uri as *mut u8, ch.uri_len);
-    let _ = Box::from_raw(uri_bytes as *mut [u8]);
-}
-
-/// Wrap a `Writer` as an [`RdfcChannel`] for the SDK.
-pub(crate) fn make_ffi_writer_channel(uri: String, writer: Writer) -> RdfcChannel {
-    let uri_bytes = uri.into_bytes().into_boxed_slice();
-    let uri_ptr = uri_bytes.as_ptr();
-    let uri_len = uri_bytes.len();
-    std::mem::forget(uri_bytes);
-
-    let state = Box::new(FfiWriterState { writer });
-    let ctx = Box::into_raw(state) as *mut c_void;
-
-    RdfcChannel {
-        uri: uri_ptr,
-        uri_len,
-        ctx,
-        read: ffi_write_noop,
-        write: ffi_write,
-        close: ffi_writer_close,
-        free_data: ffi_writer_free,
-    }
-}
-
-/// Free all resources owned by an FFI writer channel created by [`make_ffi_writer_channel`].
-///
-/// # Safety
-/// `ch` must have been produced by `make_ffi_writer_channel` and not yet freed.
-pub(crate) unsafe fn drop_ffi_writer_channel(ch: RdfcChannel) {
-    let _ = Box::from_raw(ch.ctx as *mut FfiWriterState);
-    let uri_bytes = std::slice::from_raw_parts_mut(ch.uri as *mut u8, ch.uri_len);
-    let _ = Box::from_raw(uri_bytes as *mut [u8]);
+/// Spawns a background task that drains messages from the raw writer channel
+/// and forwards them through the runner's gRPC-backed writer (preserving
+/// backpressure via the `LocalAck` protocol).
+pub(crate) fn bridge_writer(runner_writer: Writer) -> rdfc_processor_sdk::BoxedRawWriter {
+    let uri = runner_writer.channel_uri().to_string();
+    let (sdk_writer, mut bridge) = rdfc_processor_sdk::make_writer(uri);
+    tokio::spawn(async move {
+        while let Some(msg) = bridge.recv().await {
+            match msg {
+                rdfc_processor_sdk::WriterMsg::Data(data, ack) => {
+                    let result = runner_writer.write(data).await.map_err(|e| e.to_string());
+                    let _ = ack.send(result);
+                }
+                rdfc_processor_sdk::WriterMsg::Close => {
+                    runner_writer.close();
+                    break;
+                }
+            }
+        }
+    });
+    sdk_writer.into_raw()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

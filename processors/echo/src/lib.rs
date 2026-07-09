@@ -1,6 +1,7 @@
 //! Echo processor — forwards every message from `reader` to `writer`.
 
-use rdfc_processor_sdk::{futures::StreamExt, *};
+use rdfc_processor_sdk::{futures::StreamExt, ProcessorArgs, Reader, Writer};
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Config {
@@ -8,7 +9,8 @@ struct Config {
     writer: Writer,
 }
 
-async fn echo(Config { reader, writer }: Config) -> Result<(), String> {
+pub async fn echo(mut args: ProcessorArgs) -> Result<(), String> {
+    let Config { reader, writer } = args.deserialize()?;
     let mut stream = reader.into_stream();
     while let Some(bytes) = stream.next().await {
         writer.write(&bytes).await?;
@@ -17,49 +19,46 @@ async fn echo(Config { reader, writer }: Config) -> Result<(), String> {
     Ok(())
 }
 
-rdfc_export!(echo);
+rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#EchoProcessor", echo);
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use rdfc_processor_sdk::testing::*;
-    use rdfc_processor_sdk::RdfcArgs;
+    use rdfc_processor_sdk::make_writer;
+    use serde_json::json;
 
-    const ARGS: &[u8] = br#"{
-        "reader": {"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"},
-        "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"}
-    }"#;
-
-    #[test]
-    fn echo_forwards_all_messages() {
-        let (_, reader_ch) = make_mock_reader("mock://reader", vec![b"hello".to_vec(), b"world".to_vec()]);
-        let (writer_state, writer_ch) = make_mock_writer("mock://writer");
-        let reader_nc = make_named("reader", reader_ch);
-        let writer_nc = make_named("writer", writer_ch);
-        let ffi_args = RdfcArgs {
-            args_json: ARGS.as_ptr(), args_json_len: ARGS.len(),
-            readers: &reader_nc, n_readers: 1,
-            writers: &writer_nc, n_writers: 1,
-        };
-        assert_eq!(unsafe { super::rdfc_run(&ffi_args) }, 0);
-        assert_eq!(*writer_state.received.lock().unwrap(), vec![b"hello".to_vec(), b"world".to_vec()]);
-        assert!(*writer_state.closed.lock().unwrap());
+    fn args_json() -> serde_json::Value {
+        json!({
+            "reader": {"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"},
+            "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"}
+        })
     }
 
-    #[test]
-    fn echo_empty_stream_closes_writer() {
-        let (_, reader_ch) = make_mock_reader("mock://reader", vec![]);
-        let (writer_state, writer_ch) = make_mock_writer("mock://writer");
-        let reader_nc = make_named("reader", reader_ch);
-        let writer_nc = make_named("writer", writer_ch);
-        let ffi_args = RdfcArgs {
-            args_json: ARGS.as_ptr(), args_json_len: ARGS.len(),
-            readers: &reader_nc, n_readers: 1,
-            writers: &writer_nc, n_writers: 1,
-        };
-        assert_eq!(unsafe { super::rdfc_run(&ffi_args) }, 0);
-        assert!(writer_state.received.lock().unwrap().is_empty());
-        assert!(*writer_state.closed.lock().unwrap());
+    #[tokio::test]
+    async fn echo_forwards_all_messages() {
+        let reader = make_test_reader("mock://reader", vec![b"hello".to_vec(), b"world".to_vec()]);
+        let (writer, bridge) = make_writer("mock://writer".to_string());
+        let args = make_test_args(args_json(), [("reader", reader)], [("writer", writer)]);
+
+        let (result, (received, closed)) = tokio::join!(super::echo(args), collect_writer(bridge));
+
+        result.unwrap();
+        assert_eq!(received, vec![b"hello".to_vec(), b"world".to_vec()]);
+        assert!(closed);
+    }
+
+    #[tokio::test]
+    async fn echo_empty_stream_closes_writer() {
+        let reader = make_test_reader("mock://reader", vec![]);
+        let (writer, bridge) = make_writer("mock://writer".to_string());
+        let args = make_test_args(args_json(), [("reader", reader)], [("writer", writer)]);
+
+        let (result, (received, closed)) = tokio::join!(super::echo(args), collect_writer(bridge));
+
+        result.unwrap();
+        assert!(received.is_empty());
+        assert!(closed);
     }
 }

@@ -1,20 +1,25 @@
 //! # RDF-Connect Processor SDK
 //!
-//! Shared types for building RDF-Connect Rust processor plugins.
+//! Shared types for building RDF-Connect Rust processors that are compiled as
+//! `cdylib` shared libraries and loaded by the runner at pipeline-startup time.
 //!
-//! A processor crate should be compiled as a `cdylib` and use the
-//! [`rdfc_export!`] macro to expose the required FFI entry point.
+//! The FFI boundary is built on [`abi_stable`] (stable struct/vtable layout)
+//! plus [`async_ffi`] (stable `Future`s), so processor authors still write
+//! ordinary `async fn`s — the ABI machinery is entirely hidden behind
+//! [`rdfc_register!`].
 //!
-//! ## Example
+//! ## Quick start
 //!
-//! ```rust,no_run
-//! use rdfc_processor_sdk::*;
-//! use futures::StreamExt;
+//! ```rust,ignore
+//! use rdfc_processor_sdk::{ProcessorArgs, Reader, Writer};
+//! use rdfc_processor_sdk::futures::StreamExt;
+//! use serde::Deserialize;
 //!
 //! #[derive(Deserialize)]
 //! struct Config { reader: Reader, writer: Writer }
 //!
-//! async fn my_processor(Config { reader, writer }: Config) -> Result<(), String> {
+//! async fn my_processor(mut args: ProcessorArgs) -> Result<(), String> {
+//!     let Config { reader, writer } = args.deserialize()?;
 //!     let mut stream = reader.into_stream();
 //!     while let Some(bytes) = stream.next().await {
 //!         writer.write(&bytes).await?;
@@ -23,248 +28,450 @@
 //!     Ok(())
 //! }
 //!
-//! rdfc_export!(my_processor);
+//! rdfc_register!(
+//!     "https://w3id.org/rdf-connect#MyProcessor",
+//!     my_processor
+//! );
 //! ```
+//!
+//! ## A note on async runtimes
+//!
+//! Each `cdylib` links its own copy of every crate it depends on, `tokio`
+//! included. That copy does **not** share the reactor/timer driver installed
+//! by the runner's `#[tokio::main]` — only the [`Reader`]/[`Writer`] calls
+//! cross back into runner-compiled code (where a live reactor exists).
+//! Processor code must not rely on an ambient Tokio runtime (e.g.
+//! `tokio::time::sleep`, `tokio::spawn`) unless it starts its own; doing pure
+//! computation and `.await`ing [`Reader`]/[`Writer`] methods is always safe.
+
+// `#[sabi_trait]`'s expansion (abi_stable_derive 0.11.3) trips this lint on
+// current rustc; the generated `impl`s are sound, just not written the way
+// the lint expects a manually-written `impl` to be scoped.
+#![allow(non_local_definitions)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::sync::Arc;
 
-pub use serde::Deserialize;
-pub use tokio;
+pub use abi_stable;
+pub use async_ffi;
+pub use bytes;
 pub use futures;
+pub use serde::Deserialize;
 
-// ── FFI primitives ────────────────────────────────────────────────────────────
+use abi_stable::{
+    library::RootModule,
+    sabi_trait,
+    sabi_trait::prelude::TD_Opaque,
+    std_types::{RBox, RResult, RStr, RString, RVec, ROption},
+    StableAbi,
+};
+use async_ffi::{FfiFuture, FutureExt};
+use bytes::Bytes;
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
-/// Owned byte buffer returned by a `ReadFn` call.  
-/// The runner allocates this memory; the processor must call `free_data` to release it.
-#[repr(C)]
-pub struct RdfcData {
-    pub ptr: *mut u8,
-    pub len: usize,
+// ── ABI compatibility token ────────────────────────────────────────────────────
+
+/// Opaque token identifying the exact SDK / `abi_stable` / `async-ffi` versions
+/// this crate was built against.
+///
+/// The runner compares this against the `:abiStable` literal declared in a
+/// processor's `processor.ttl` *before* downloading or loading anything, so a
+/// mismatch produces a clear diagnostic instead of a layout-check failure deep
+/// inside `abi_stable::library::RootModule::load_from_file`.
+///
+/// This is a convenience pre-flight check on top of (not a replacement for)
+/// `abi_stable`'s own type-layout verification, which still runs at load time.
+pub const ABI_TOKEN: &str = concat!(
+    "rdfc-processor-sdk-",
+    env!("CARGO_PKG_VERSION"),
+    "+abi_stable-0.11.3+async-ffi-0.5.0"
+);
+
+// ── Raw (FFI-safe) channel trait objects ──────────────────────────────────────
+
+/// FFI-safe interface for reading messages from an input channel.
+///
+/// Implemented by the runner and passed across the ABI boundary as a trait
+/// object; processor authors interact with [`Reader`] instead.
+#[sabi_trait]
+pub trait RawReader: Send + Sync {
+    /// Read the next message, or `RNone` when the channel is closed.
+    #[sabi(last_prefix_field)]
+    fn read(&self) -> FfiFuture<ROption<RVec<u8>>>;
 }
 
-/// Called by the processor to read the next message from an input channel.
+/// FFI-safe interface for writing messages to an output channel.
 ///
-/// Blocking: returns when a message is available or the channel is closed.
-///
-/// Returns:
-/// - `0`  — data available; `*out` is populated, caller must call `free_data`.
-/// - `1`  — channel closed, no more messages.
-/// - `-1` — error.
-pub type ReadFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut RdfcData) -> i32;
-
-/// Called by the processor to write bytes to an output channel.
-///
-/// Blocking: returns when the downstream runner has acknowledged the message
-/// (backpressure).
-///
-/// Returns `0` on success, `-1` on error.
-pub type WriteFn = unsafe extern "C" fn(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32;
-
-/// Called to signal that no more data will be sent on this channel.
-pub type CloseFn = unsafe extern "C" fn(ctx: *mut c_void);
-
-/// Called to release memory allocated by `ReadFn`.
-pub type FreeDataFn = unsafe extern "C" fn(ptr: *mut u8, len: usize);
-
-// ── Channel descriptors ───────────────────────────────────────────────────────
-
-/// A single bidirectional channel descriptor passed over the FFI boundary.
-/// Each field is valid for the lifetime of the `rdfc_run` call.
-#[repr(C)]
-pub struct RdfcChannel {
-    /// Channel URI string (not null-terminated).
-    pub uri: *const u8,
-    pub uri_len: usize,
-
-    /// Opaque per-channel state owned by the runner.
-    pub ctx: *mut c_void,
-
-    pub read: ReadFn,
-    pub write: WriteFn,
-    pub close: CloseFn,
-    pub free_data: FreeDataFn,
+/// Implemented by the runner and passed across the ABI boundary as a trait
+/// object; processor authors interact with [`Writer`] instead.
+#[sabi_trait]
+pub trait RawWriter: Send + Sync {
+    /// Write a message and await backpressure acknowledgement from the runner.
+    fn write(&self, data: RVec<u8>) -> FfiFuture<RResult<(), RString>>;
+    /// Signal that no more messages will be written.
+    #[sabi(last_prefix_field)]
+    fn close(&self);
 }
 
-/// Named channel entry inside [`RdfcArgs`].
-#[repr(C)]
-pub struct RdfcNamedChannel {
-    /// Field name from the SHACL shape (e.g. `"reader"`, `"input"`).
-    pub name: *const u8,
-    pub name_len: usize,
-    pub channel: RdfcChannel,
-}
+/// A type-erased [`RawReader`] trait object.
+pub type BoxedRawReader = RawReader_TO<'static, RBox<()>>;
+/// A type-erased [`RawWriter`] trait object.
+pub type BoxedRawWriter = RawWriter_TO<'static, RBox<()>>;
 
-/// All arguments passed to [`rdfc_run`].
-#[repr(C)]
-pub struct RdfcArgs {
-    /// Raw JSON bytes of the processor arguments (non-null-terminated).
-    pub args_json: *const u8,
-    pub args_json_len: usize,
+// ── Raw processor arguments (crosses the FFI boundary) ────────────────────────
 
-    pub readers: *const RdfcNamedChannel,
-    pub n_readers: usize,
-
-    pub writers: *const RdfcNamedChannel,
-    pub n_writers: usize,
-}
-
-// ── Channel wrappers ──────────────────────────────────────────────────────────
-
-/// Ergonomic reader backed by the FFI [`RdfcChannel`].
+/// One reader entry, as passed across the FFI boundary.
 ///
-/// Implements [`serde::Deserialize`]: when a field is annotated with type
-/// `Reader` in a `#[derive(Deserialize)]` config struct, the deserializer reads
-/// the `@id` URI from the JSON-LD channel reference and looks up the actual
-/// channel from the thread-local pool installed by [`ProcessorContext::deserialize`].
+/// `uri` is the channel's true URI (the `@id` used by the JSON-LD argument
+/// object) — not the SHACL field name — since that's what
+/// [`ProcessorArgs::deserialize`] matches on.
+#[repr(C)]
+#[derive(StableAbi)]
+pub struct RawNamedReader {
+    pub uri: RString,
+    pub reader: BoxedRawReader,
+}
+
+/// One writer entry, as passed across the FFI boundary. See [`RawNamedReader`].
+#[repr(C)]
+#[derive(StableAbi)]
+pub struct RawNamedWriter {
+    pub uri: RString,
+    pub writer: BoxedRawWriter,
+}
+
+/// All arguments passed to a processor factory across the FFI boundary.
+#[repr(C)]
+#[derive(StableAbi)]
+pub struct RawProcessorArgs {
+    /// Raw JSON-LD argument object, serialized to a string by the runner.
+    pub args_json: RString,
+    pub readers: RVec<RawNamedReader>,
+    pub writers: RVec<RawNamedWriter>,
+}
+
+// ── Registration / root module (exported by every processor cdylib) ──────────
+
+/// One processor type exported by a `cdylib`.
+#[repr(C)]
+#[derive(StableAbi)]
+pub struct Registration {
+    /// The RDF class URI of this processor (e.g. `"https://w3id.org/rdf-connect#EchoProcessor"`).
+    pub type_uri: RStr<'static>,
+    /// Factory function that runs the processor given its arguments.
+    pub factory: extern "C" fn(RawProcessorArgs) -> FfiFuture<RResult<(), RString>>,
+}
+
+/// Root module exported by every processor `cdylib` (one per shared library).
+///
+/// A single well-known `#[no_mangle]` symbol (generated by
+/// `#[export_root_module]`) carries this struct's vtable, which is why
+/// processor registration survives `cdylib` symbol stripping without any
+/// `linkme`/`inventory` link-time collection tricks — see [`rdfc_register!`].
+#[repr(C)]
+#[derive(StableAbi)]
+#[sabi(kind(Prefix(prefix_ref = ProcessorModuleRef)))]
+#[sabi(missing_field(panic))]
+pub struct ProcessorModule {
+    /// Must equal [`ABI_TOKEN`] on the loading side.
+    pub abi_token: RStr<'static>,
+    #[sabi(last_prefix_field)]
+    pub registrations: extern "C" fn() -> RVec<Registration>,
+}
+
+impl RootModule for ProcessorModuleRef {
+    abi_stable::declare_root_module_statics! {ProcessorModuleRef}
+    const BASE_NAME: &'static str = "rdfc_processor";
+    const NAME: &'static str = "rdfc_processor";
+    const VERSION_STRINGS: abi_stable::sabi_types::VersionStrings =
+        abi_stable::package_version_strings!();
+}
+
+// ── rdfc_register! macro ──────────────────────────────────────────────────────
+
+/// Register a processor so the runner can load it from the compiled `cdylib`.
+///
+/// Call this once at the module level of a processor crate (`crate-type =
+/// ["cdylib"]`). It generates the crate's single [`ProcessorModule`] export —
+/// only one processor type per shared library is supported.
+///
+/// # Arguments
+/// - `$type_uri` — the RDF class URI string (must match the class the
+///   processor's `processor.ttl` shape targets).
+/// - `$fn` — an async function `fn(ProcessorArgs) -> Result<(), String>`.
+#[macro_export]
+macro_rules! rdfc_register {
+    ($type_uri:expr, $fn:path) => {
+        extern "C" fn __rdfc_factory(
+            raw: $crate::RawProcessorArgs,
+        ) -> $crate::async_ffi::FfiFuture<
+            $crate::abi_stable::std_types::RResult<(), $crate::abi_stable::std_types::RString>,
+        > {
+            use $crate::async_ffi::FutureExt;
+            async move {
+                let args = $crate::ProcessorArgs::from_raw(raw);
+                match $fn(args).await {
+                    Ok(()) => $crate::abi_stable::std_types::RResult::ROk(()),
+                    Err(e) => $crate::abi_stable::std_types::RResult::RErr(e.into()),
+                }
+            }
+            .into_ffi()
+        }
+
+        extern "C" fn __rdfc_registrations(
+        ) -> $crate::abi_stable::std_types::RVec<$crate::Registration> {
+            $crate::abi_stable::std_types::RVec::from(vec![$crate::Registration {
+                type_uri: $crate::abi_stable::std_types::RStr::from_str($type_uri),
+                factory: __rdfc_factory,
+            }])
+        }
+
+        #[$crate::abi_stable::export_root_module]
+        pub fn __rdfc_root_module() -> $crate::ProcessorModuleRef {
+            use $crate::abi_stable::prefix_type::PrefixTypeTrait;
+            $crate::ProcessorModule {
+                abi_token: $crate::abi_stable::std_types::RStr::from_str($crate::ABI_TOKEN),
+                registrations: __rdfc_registrations,
+            }
+            .leak_into_prefix()
+        }
+    };
+}
+
+// ── Reader ────────────────────────────────────────────────────────────────────
+
+/// Input channel for a processor.
+///
+/// Implements [`serde::Deserialize`]: when a config struct has a `Reader`
+/// field, the deserializer matches the `@id` URI from the JSON-LD argument
+/// and retrieves the matching channel from the thread-local pool installed by
+/// [`ProcessorArgs::deserialize`].
 pub struct Reader {
-    channel: *const RdfcChannel,
+    uri: String,
+    inner: BoxedRawReader,
 }
-
-// SAFETY: the runner guarantees `RdfcChannel` is valid for the duration of `rdfc_run`.
-unsafe impl Send for Reader {}
-unsafe impl Sync for Reader {}
 
 impl Reader {
-    /// The channel URI (as registered by the orchestrator).
+    #[doc(hidden)]
+    pub fn from_parts(uri: String, inner: BoxedRawReader) -> Self {
+        Reader { uri, inner }
+    }
+
+    /// The channel URI as provided by the orchestrator.
     pub fn channel_uri(&self) -> &str {
-        unsafe {
-            let bytes = std::slice::from_raw_parts((*self.channel).uri, (*self.channel).uri_len);
-            std::str::from_utf8_unchecked(bytes)
-        }
+        &self.uri
     }
 
     /// Receive the next message from the channel.
-    ///
     /// Returns `None` when the channel is closed (no more messages).
-    /// Internally runs the blocking FFI call on a `spawn_blocking` thread so
-    /// the async runtime remains unblocked.
-    pub async fn read(&mut self) -> Option<Vec<u8>> {
-        let ptr = self.channel as usize;
-        tokio::task::spawn_blocking(move || {
-            let ch = ptr as *const RdfcChannel;
-            let mut data = RdfcData { ptr: std::ptr::null_mut(), len: 0 };
-            let rc = unsafe { ((*ch).read)((*ch).ctx, &mut data) };
-            if rc == 0 {
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(data.ptr, data.len) }.to_vec();
-                unsafe { ((*ch).free_data)(data.ptr, data.len) };
-                Some(bytes)
-            } else {
-                if rc < 0 {
-                    eprintln!("[rdfc] reader FFI error (rc={rc}), treating as EOF");
-                }
-                None
-            }
-        })
-        .await
-        .expect("reader spawn_blocking")
+    pub async fn read(&self) -> Option<Bytes> {
+        self.inner
+            .read()
+            .await
+            .into_option()
+            .map(|v| Bytes::from(v.into_vec()))
     }
 
-    /// Consume the reader as an async `Stream` of byte messages.
-    ///
-    /// ```ignore
-    /// use futures::StreamExt;
-    ///
-    /// let mut stream = reader.into_stream();
-    /// while let Some(bytes) = stream.next().await { … }
-    /// ```
-    pub fn into_stream(
-        self,
-    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Vec<u8>> + Send>> {
-        Box::pin(futures::stream::unfold(self, |mut reader| async {
-            reader.read().await.map(|bytes| (bytes, reader))
+    /// Consume the reader as an async [`Stream`](futures::Stream) of byte messages.
+    pub fn into_stream(self) -> std::pin::Pin<Box<dyn futures::Stream<Item = Bytes> + Send>> {
+        Box::pin(futures::stream::unfold(self, |r| async {
+            r.read().await.map(|b| (b, r))
         }))
+    }
+
+    /// Extract the raw FFI trait object, discarding the URI.
+    ///
+    /// Used by the runner to build [`RawNamedReader`] entries when crossing
+    /// into a processor's `cdylib` — not normally called by processor authors.
+    #[doc(hidden)]
+    pub fn into_raw(self) -> BoxedRawReader {
+        self.inner
     }
 }
 
-/// Ergonomic writer backed by the FFI [`RdfcChannel`].
+// ── Writer ────────────────────────────────────────────────────────────────────
+
+/// Output channel for a processor.
 ///
 /// Implements [`serde::Deserialize`] the same way as [`Reader`].
 pub struct Writer {
-    channel: *const RdfcChannel,
-    closed: std::sync::atomic::AtomicBool,
+    uri: String,
+    inner: BoxedRawWriter,
 }
 
-unsafe impl Send for Writer {}
-unsafe impl Sync for Writer {}
-
 impl Writer {
-    /// The channel URI (as registered by the orchestrator).
+    #[doc(hidden)]
+    pub fn from_parts(uri: String, inner: BoxedRawWriter) -> Self {
+        Writer { uri, inner }
+    }
+
+    /// The channel URI as provided by the orchestrator.
     pub fn channel_uri(&self) -> &str {
-        unsafe {
-            let bytes = std::slice::from_raw_parts((*self.channel).uri, (*self.channel).uri_len);
-            std::str::from_utf8_unchecked(bytes)
-        }
+        &self.uri
     }
 
-    /// Send bytes to the channel.
-    ///
-    /// Internally runs the blocking FFI call on a `spawn_blocking` thread.
+    /// Send bytes and await confirmation from the underlying channel.
     pub async fn write(&self, data: &[u8]) -> Result<(), String> {
-        let ptr = self.channel as usize;
-        let data = data.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let ch = ptr as *const RdfcChannel;
-            let rc = unsafe { ((*ch).write)((*ch).ctx, data.as_ptr(), data.len()) };
-            if rc == 0 { Ok(()) } else { Err(format!("write failed with code {rc}")) }
-        })
-        .await
-        .expect("writer spawn_blocking")
+        self.inner
+            .write(RVec::from(data.to_vec()))
+            .await
+            .into_result()
+            .map_err(|e| e.into_string())
     }
 
-    /// Send a UTF-8 string to the channel.
+    /// Send a UTF-8 string and await confirmation.
     pub async fn write_str(&self, s: &str) -> Result<(), String> {
         self.write(s.as_bytes()).await
     }
 
     /// Signal that no more data will be written to this channel.
     pub fn close(&self) {
-        if !self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            unsafe { ((*self.channel).close)((*self.channel).ctx) }
-        }
+        self.inner.close()
+    }
+
+    /// Extract the raw FFI trait object, discarding the URI.
+    ///
+    /// Used by the runner to build [`RawNamedWriter`] entries when crossing
+    /// into a processor's `cdylib` — not normally called by processor authors.
+    #[doc(hidden)]
+    pub fn into_raw(self) -> BoxedRawWriter {
+        self.inner
     }
 }
 
-impl Drop for Writer {
-    fn drop(&mut self) {
-        self.close();
+// ── Channel bridge (mpsc-backed RawReader / RawWriter impls) ──────────────────
+//
+// Used both by the runner (bridging its gRPC-backed channels to the SDK's
+// FFI-safe trait objects) and by the `testing` module (in-process mocks) —
+// the same code path is exercised in both cases.
+
+struct ChannelReader {
+    rx: Arc<AsyncMutex<mpsc::UnboundedReceiver<Option<Bytes>>>>,
+}
+
+impl RawReader for ChannelReader {
+    fn read(&self) -> FfiFuture<ROption<RVec<u8>>> {
+        let rx = self.rx.clone();
+        async move {
+            let mut guard = rx.lock().await;
+            match guard.recv().await.flatten() {
+                Some(data) => ROption::RSome(RVec::from(data.to_vec())),
+                None => ROption::RNone,
+            }
+        }
+        .into_ffi()
+    }
+}
+
+/// A single message flowing through the writer bridge.
+///
+/// `Data` carries the payload plus a one-shot ack that the bridge must send
+/// once the underlying channel has accepted the data (preserving backpressure).
+pub enum WriterMsg {
+    Data(Bytes, oneshot::Sender<Result<(), String>>),
+    Close,
+}
+
+struct ChannelWriter {
+    tx: mpsc::UnboundedSender<WriterMsg>,
+}
+
+impl RawWriter for ChannelWriter {
+    fn write(&self, data: RVec<u8>) -> FfiFuture<RResult<(), RString>> {
+        let tx = self.tx.clone();
+        async move {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if tx
+                .send(WriterMsg::Data(Bytes::from(data.into_vec()), ack_tx))
+                .is_err()
+            {
+                return RResult::RErr(RString::from("writer channel closed"));
+            }
+            match ack_rx.await {
+                Ok(Ok(())) => RResult::ROk(()),
+                Ok(Err(e)) => RResult::RErr(RString::from(e)),
+                Err(_) => RResult::RErr(RString::from("writer bridge closed")),
+            }
+        }
+        .into_ffi()
+    }
+
+    fn close(&self) {
+        let _ = self.tx.send(WriterMsg::Close);
+    }
+}
+
+/// Create an SDK [`Reader`] together with a [`ReaderBridge`] for the runner to push data in.
+pub fn make_reader(uri: String) -> (Reader, ReaderBridge) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let inner = RawReader_TO::from_value(
+        ChannelReader {
+            rx: Arc::new(AsyncMutex::new(rx)),
+        },
+        TD_Opaque,
+    );
+    (Reader::from_parts(uri, inner), ReaderBridge { tx })
+}
+
+/// Create an SDK [`Writer`] together with a [`WriterBridge`] for the runner to drain data from.
+pub fn make_writer(uri: String) -> (Writer, WriterBridge) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let inner = RawWriter_TO::from_value(ChannelWriter { tx }, TD_Opaque);
+    (Writer::from_parts(uri, inner), WriterBridge { rx })
+}
+
+/// Runner-side handle for feeding data into an SDK [`Reader`].
+pub struct ReaderBridge {
+    tx: mpsc::UnboundedSender<Option<Bytes>>,
+}
+
+impl ReaderBridge {
+    /// Push a data message.
+    pub fn send(&self, data: Bytes) -> Result<(), String> {
+        self.tx
+            .send(Some(data))
+            .map_err(|_| "reader bridge closed".to_string())
+    }
+    /// Signal EOF — no more data will follow.
+    pub fn close(&self) {
+        let _ = self.tx.send(None);
+    }
+}
+
+/// Runner-side handle for draining data that a processor writes.
+pub struct WriterBridge {
+    rx: mpsc::UnboundedReceiver<WriterMsg>,
+}
+
+impl WriterBridge {
+    /// Receive the next writer message (data or close).
+    pub async fn recv(&mut self) -> Option<WriterMsg> {
+        self.rx.recv().await
     }
 }
 
 // ── Thread-local channel pools (used during deserialization) ──────────────────
 
-// When `ProcessorContext::deserialize::<C>()` is called, the reader and writer
-// channels are temporarily moved into these thread-local pools keyed by channel
-// URI.  The custom `Deserialize` impls for `Reader` and `Writer` pop entries
-// from these pools by matching the `@id` found in the JSON-LD argument object.
 thread_local! {
     static READER_POOL: RefCell<HashMap<String, Reader>> = RefCell::new(HashMap::new());
     static WRITER_POOL: RefCell<HashMap<String, Writer>> = RefCell::new(HashMap::new());
 }
 
-// ── serde::Deserialize for Reader ─────────────────────────────────────────────
-
 impl<'de> serde::Deserialize<'de> for Reader {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-
-        // The orchestrator sends channel references as JSON-LD objects:
-        // { "@type": "https://w3id.org/rdf-connect#Reader", "@id": "<channel-uri>" }
         #[derive(serde::Deserialize)]
         struct ChannelRef {
             #[serde(rename = "@id")]
             id: String,
         }
-
         let chan = ChannelRef::deserialize(deserializer)?;
-
         READER_POOL.with(|pool| {
             pool.borrow_mut().remove(&chan.id).ok_or_else(|| {
                 D::Error::custom(format!(
                     "no reader registered for channel '{}' — \
-                     make sure to call ProcessorContext::deserialize()",
+                     call ProcessorArgs::deserialize() to populate the pool",
                     chan.id
                 ))
             })
@@ -272,25 +479,20 @@ impl<'de> serde::Deserialize<'de> for Reader {
     }
 }
 
-// ── serde::Deserialize for Writer ─────────────────────────────────────────────
-
 impl<'de> serde::Deserialize<'de> for Writer {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-
         #[derive(serde::Deserialize)]
         struct ChannelRef {
             #[serde(rename = "@id")]
             id: String,
         }
-
         let chan = ChannelRef::deserialize(deserializer)?;
-
         WRITER_POOL.with(|pool| {
             pool.borrow_mut().remove(&chan.id).ok_or_else(|| {
                 D::Error::custom(format!(
                     "no writer registered for channel '{}' — \
-                     make sure to call ProcessorContext::deserialize()",
+                     call ProcessorArgs::deserialize() to populate the pool",
                     chan.id
                 ))
             })
@@ -298,72 +500,67 @@ impl<'de> serde::Deserialize<'de> for Writer {
     }
 }
 
-// ── ProcessorContext ──────────────────────────────────────────────────────────
+// ── ProcessorArgs ─────────────────────────────────────────────────────────────
 
-/// High-level view of the arguments passed to a processor.
-pub struct ProcessorContext {
-    /// Raw JSON args (full JSON-LD including Reader/Writer channel objects).
+/// All arguments handed to a processor at runtime.
+///
+/// The `readers` and `writers` maps are keyed by SHACL field name
+/// (e.g. `"reader"`, `"input"`).  Call [`ProcessorArgs::deserialize`] to
+/// unpack them into a typed config struct.
+pub struct ProcessorArgs {
+    /// Full JSON-LD argument object (Reader/Writer fields included).
     pub args: serde_json::Value,
     readers: HashMap<String, Reader>,
     writers: HashMap<String, Writer>,
 }
 
-impl ProcessorContext {
-    /// Build a `ProcessorContext` from the raw FFI args.
-    ///
-    /// # Safety
-    /// `ffi_args` must be a valid pointer produced by the runner.
-    pub unsafe fn from_ffi(ffi_args: *const RdfcArgs) -> Self {
-        let a = &*ffi_args;
+impl ProcessorArgs {
+    /// Construct a `ProcessorArgs`.  Normally called by the runner, not by processors.
+    pub fn new(
+        args: serde_json::Value,
+        readers: HashMap<String, Reader>,
+        writers: HashMap<String, Writer>,
+    ) -> Self {
+        ProcessorArgs {
+            args,
+            readers,
+            writers,
+        }
+    }
 
-        let json_bytes = std::slice::from_raw_parts(a.args_json, a.args_json_len);
+    /// Build a `ProcessorArgs` from the raw FFI arguments handed across the
+    /// ABI boundary. Called by [`rdfc_register!`]'s generated factory — not
+    /// normally called directly by processor authors.
+    #[doc(hidden)]
+    pub fn from_raw(raw: RawProcessorArgs) -> Self {
         let args: serde_json::Value =
-            serde_json::from_slice(json_bytes).unwrap_or(serde_json::Value::Null);
-
-        let mut readers = HashMap::new();
-        let reader_slice = std::slice::from_raw_parts(a.readers, a.n_readers);
-        for nc in reader_slice {
-            let name_bytes = std::slice::from_raw_parts(nc.name, nc.name_len);
-            let name = String::from_utf8_lossy(name_bytes).into_owned();
-            readers.insert(name, Reader { channel: &nc.channel });
-        }
-
-        let mut writers = HashMap::new();
-        let writer_slice = std::slice::from_raw_parts(a.writers, a.n_writers);
-        for nc in writer_slice {
-            let name_bytes = std::slice::from_raw_parts(nc.name, nc.name_len);
-            let name = String::from_utf8_lossy(name_bytes).into_owned();
-            writers.insert(name, Writer { channel: &nc.channel, closed: std::sync::atomic::AtomicBool::new(false) });
-        }
-
-        ProcessorContext { args, readers, writers }
+            serde_json::from_str(raw.args_json.as_str()).unwrap_or(serde_json::Value::Null);
+        let readers = raw
+            .readers
+            .into_iter()
+            .map(|nr| {
+                let uri = nr.uri.into_string();
+                (uri.clone(), Reader::from_parts(uri, nr.reader))
+            })
+            .collect();
+        let writers = raw
+            .writers
+            .into_iter()
+            .map(|nw| {
+                let uri = nw.uri.into_string();
+                (uri.clone(), Writer::from_parts(uri, nw.writer))
+            })
+            .collect();
+        ProcessorArgs::new(args, readers, writers)
     }
 
     /// Deserialize the processor's JSON-LD config into a typed struct `C`.
     ///
-    /// Any `Reader` or `Writer` fields in `C` are automatically populated by
-    /// matching the `@id` URI in the JSON-LD against the channels passed by the
-    /// runner.  All other fields deserialize normally from the JSON.
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # use rdfc_processor_sdk::*;
-    /// # use serde::Deserialize;
-    /// #[derive(Deserialize)]
-    /// struct Config {
-    ///     reader: Reader,
-    ///     writer: Writer,
-    ///     label: Option<String>,
-    /// }
-    ///
-    /// fn run(mut ctx: ProcessorContext) -> Result<(), String> {
-    ///     let Config { reader, writer, label } = ctx.deserialize()?;
-    ///     // ...
-    /// #   Ok(())
-    /// }
-    /// ```
+    /// Any `Reader` or `Writer` fields in `C` are populated by matching the
+    /// `@id` URI in the JSON-LD against the channels passed by the runner.
     pub fn deserialize<C: serde::de::DeserializeOwned>(&mut self) -> Result<C, String> {
-        // Rekey channels by URI so the Deserialize impls can look them up by @id.
+        // Rekey by the channel's true URI (not whatever key `self.readers`/
+        // `self.writers` happened to use) since that's what `@id` matches.
         let reader_pool: HashMap<String, Reader> = self
             .readers
             .drain()
@@ -380,178 +577,69 @@ impl ProcessorContext {
 
         let result = serde_json::from_value::<C>(self.args.clone()).map_err(|e| e.to_string());
 
-        // Clean up any channels that weren't consumed (e.g. optional ones).
         READER_POOL.with(|p| p.borrow_mut().clear());
         WRITER_POOL.with(|p| p.borrow_mut().clear());
 
         result
     }
-
-    /// Get a reader by SHACL field name (lower-level alternative to `deserialize`).
-    pub fn reader(&self, name: &str) -> Result<&Reader, String> {
-        self.readers.get(name).ok_or_else(|| format!("no reader named '{name}'"))
-    }
-
-    /// Get a writer by SHACL field name (lower-level alternative to `deserialize`).
-    pub fn writer(&self, name: &str) -> Result<&Writer, String> {
-        self.writers.get(name).ok_or_else(|| format!("no writer named '{name}'"))
-    }
 }
 
-// ── Test helpers ─────────────────────────────────────────────────────────────
+// ── Test helpers ──────────────────────────────────────────────────────────────
 
-/// Utilities for writing unit-tests against processor functions.
+/// Utilities for writing unit tests against processor functions.
 pub mod testing {
-    use std::collections::VecDeque;
-    use std::ffi::c_void;
-    use std::sync::{Arc, Mutex};
+    use super::{make_reader, ProcessorArgs, Reader, Writer, WriterBridge, WriterMsg};
+    use bytes::Bytes;
+    use std::collections::HashMap;
 
-    use crate::{RdfcChannel, RdfcData, RdfcNamedChannel};
-
-    pub struct MockReaderState {
-        pub messages: Mutex<VecDeque<Vec<u8>>>,
-    }
-
-    pub struct MockWriterState {
-        pub received: Mutex<Vec<Vec<u8>>>,
-        pub closed: Mutex<bool>,
-    }
-
-    unsafe extern "C" fn mock_read(ctx: *mut c_void, out: *mut RdfcData) -> i32 {
-        let state = &*(ctx as *const MockReaderState);
-        match state.messages.lock().unwrap().pop_front() {
-            Some(msg) => {
-                let mut boxed = msg.into_boxed_slice();
-                let ptr = boxed.as_mut_ptr();
-                let len = boxed.len();
-                std::mem::forget(boxed);
-                (*out) = RdfcData { ptr, len };
-                0
-            }
-            None => 1,
+    /// Create a [`Reader`] pre-populated with `messages`.
+    /// An EOF signal is automatically appended so the processor loop terminates.
+    pub fn make_test_reader(uri: &str, messages: Vec<Vec<u8>>) -> Reader {
+        let (reader, bridge) = make_reader(uri.to_string());
+        for msg in messages {
+            bridge.send(Bytes::from(msg)).expect("bridge open");
         }
+        bridge.close();
+        reader
     }
 
-    unsafe extern "C" fn mock_write(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
-        let state = &*(ctx as *const MockWriterState);
-        let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
-        state.received.lock().unwrap().push(bytes);
-        0
-    }
-
-    unsafe extern "C" fn mock_close_writer(ctx: *mut c_void) {
-        let state = &*(ctx as *const MockWriterState);
-        *state.closed.lock().unwrap() = true;
-    }
-
-    unsafe extern "C" fn noop_read(_: *mut c_void, _: *mut RdfcData) -> i32 { 1 }
-    unsafe extern "C" fn noop_write(_: *mut c_void, _: *const u8, _: usize) -> i32 { 0 }
-    unsafe extern "C" fn noop_close(_: *mut c_void) {}
-    unsafe extern "C" fn mock_free_data(ptr: *mut u8, len: usize) {
-        let _ = unsafe { Vec::from_raw_parts(ptr, len, len) };
-    }
-
-    /// A mock reader channel backed by an in-memory queue.
+    /// Drain all messages from a [`WriterBridge`], auto-acking each write.
     ///
-    /// `uri` must match the `@id` used in the test args JSON when calling
-    /// [`ProcessorContext::deserialize`].
-    pub fn make_mock_reader(uri: &'static str, messages: Vec<Vec<u8>>) -> (Arc<MockReaderState>, RdfcChannel) {
-        let state = Arc::new(MockReaderState { messages: Mutex::new(messages.into()) });
-        let raw = Arc::into_raw(Arc::clone(&state)) as *mut c_void;
-        let channel = RdfcChannel {
-            uri: uri.as_ptr(),
-            uri_len: uri.len(),
-            ctx: raw,
-            read: mock_read,
-            write: noop_write,
-            close: noop_close,
-            free_data: mock_free_data,
-        };
-        (state, channel)
-    }
-
-    /// A mock writer channel that collects written bytes.
-    ///
-    /// `uri` must match the `@id` used in the test args JSON when calling
-    /// [`ProcessorContext::deserialize`].
-    pub fn make_mock_writer(uri: &'static str) -> (Arc<MockWriterState>, RdfcChannel) {
-        let state = Arc::new(MockWriterState {
-            received: Mutex::new(Vec::new()),
-            closed: Mutex::new(false),
-        });
-        let raw = Arc::into_raw(Arc::clone(&state)) as *mut c_void;
-        let channel = RdfcChannel {
-            uri: uri.as_ptr(),
-            uri_len: uri.len(),
-            ctx: raw,
-            read: noop_read,
-            write: mock_write,
-            close: mock_close_writer,
-            free_data: mock_free_data,
-        };
-        (state, channel)
-    }
-
-    /// Build a [`RdfcNamedChannel`] for testing (wraps a channel with a field name).
-    pub fn make_named(name: &'static str, channel: RdfcChannel) -> RdfcNamedChannel {
-        RdfcNamedChannel { name: name.as_ptr(), name_len: name.len(), channel }
-    }
-}
-
-// ── Export macro ──────────────────────────────────────────────────────────────
-
-/// Export a processor function as the standard `rdfc_run` FFI entry point.
-///
-/// Works for both sync and async processor functions — Rust infers the config
-/// type from the function signature.
-///
-/// ```ignore
-/// use rdfc_processor_sdk::*;
-///
-/// #[derive(Deserialize)]
-/// struct Config { reader: Reader, writer: Writer }
-///
-/// // sync
-/// fn my_processor(cfg: Config) -> Result<(), String> { … }
-///
-/// // or async
-/// async fn my_processor(cfg: Config) -> Result<(), String> { … }
-///
-/// rdfc_export!(my_processor);
-/// ```
-#[macro_export]
-macro_rules! rdfc_export {
-    ($run_fn:path) => {
-        /// Entry point called by the RDF-Connect Rust runner.
-        ///
-        /// # Safety
-        /// `args` must be a valid `RdfcArgs` pointer produced by the runner.
-        #[no_mangle]
-        pub unsafe extern "C" fn rdfc_run(
-            args: *const rdfc_processor_sdk::RdfcArgs,
-        ) -> i32 {
-            let result = std::panic::catch_unwind(|| {
-                let mut ctx =
-                    unsafe { rdfc_processor_sdk::ProcessorContext::from_ffi(args) };
-                // T inferred from $run_fn's parameter type; block_on drives the async fn.
-                let config = ctx.deserialize()?;
-                rdfc_processor_sdk::tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("tokio runtime")
-                    .block_on($run_fn(config))
-            });
-            match result {
-                Ok(Ok(())) => 0,
-                Ok(Err(e)) => {
-                    eprintln!("[rdfc] processor error: {e}");
-                    -1
+    /// Returns `(messages, was_closed)`.
+    pub async fn collect_writer(mut bridge: WriterBridge) -> (Vec<Vec<u8>>, bool) {
+        let mut received = Vec::new();
+        let mut closed = false;
+        while let Some(msg) = bridge.recv().await {
+            match msg {
+                WriterMsg::Data(data, ack) => {
+                    received.push(data.to_vec());
+                    let _ = ack.send(Ok(()));
                 }
-                Err(_) => {
-                    eprintln!("[rdfc] processor panicked");
-                    -1
+                WriterMsg::Close => {
+                    closed = true;
+                    break;
                 }
             }
         }
-    };
+        (received, closed)
+    }
+
+    /// Build a [`ProcessorArgs`] for testing from raw JSON and pre-built channels.
+    pub fn make_test_args(
+        json: serde_json::Value,
+        readers: impl IntoIterator<Item = (&'static str, Reader)>,
+        writers: impl IntoIterator<Item = (&'static str, Writer)>,
+    ) -> ProcessorArgs {
+        ProcessorArgs::new(
+            json,
+            readers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<HashMap<_, _>>(),
+            writers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
 }

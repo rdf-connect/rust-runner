@@ -5,21 +5,16 @@ use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::channel::{make_ffi_reader_channel, make_ffi_writer_channel, Reader, Writer};
-use rdfc_processor_sdk::RdfcChannel;
+use crate::channel::{bridge_reader, bridge_writer, Reader, Writer};
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 /// A processor handles a discrete data-processing step in an RDF-Connect pipeline.
 ///
-/// The three-phase lifecycle mirrors the JS and JVM runner implementations:
-///
-/// 1. `init`      – allocate external resources (DB connections, file handles, …).
-///                  Awaited before sending `ProcessorInitialized` to the orchestrator.
-/// 2. `transform` – register listeners / start consuming input channels.  
-///                  Started (but not awaited) right after `init`.
-/// 3. `produce`   – emit data on output channels.  
-///                  Called in parallel for all processors after the `start` signal.
+/// Three-phase lifecycle:
+/// 1. `init`      – allocate external resources; awaited before `ProcessorInitialized`.
+/// 2. `transform` – register listeners / start consuming input channels.
+/// 3. `produce`   – emit data on output channels; called after the `start` signal.
 #[async_trait]
 pub trait Processor: Send {
     async fn init(&mut self) -> Result<()>;
@@ -45,54 +40,47 @@ impl ProcessorContext {
         readers: HashMap<String, Reader>,
         writers: HashMap<String, Writer>,
     ) -> Self {
-        ProcessorContext {
-            uri,
-            args,
-            readers,
-            writers,
-        }
+        ProcessorContext { uri, args, readers, writers }
     }
 
-    /// Move a reader out of the context by field name.
-    pub fn take_reader(&mut self, name: &str) -> Result<Reader> {
-        self.readers
-            .remove(name)
-            .ok_or_else(|| anyhow::anyhow!("processor '{}': no reader named '{name}'", self.uri))
-    }
+    /// Convert this context into a [`rdfc_processor_sdk::RawProcessorArgs`],
+    /// ready to cross the FFI boundary into a processor `cdylib`.
+    ///
+    /// Bridge tasks (gRPC-backed runner channel ↔ raw FFI channel) are
+    /// spawned on the current tokio executor.
+    pub fn into_raw_args(self) -> rdfc_processor_sdk::RawProcessorArgs {
+        use rdfc_processor_sdk::abi_stable::std_types::{RString, RVec};
+        use rdfc_processor_sdk::{RawNamedReader, RawNamedWriter};
 
-    /// Move a writer out of the context by field name.
-    pub fn take_writer(&mut self, name: &str) -> Result<Writer> {
-        self.writers
-            .remove(name)
-            .ok_or_else(|| anyhow::anyhow!("processor '{}': no writer named '{name}'", self.uri))
-    }
-    /// Consume the context and convert readers/writers to FFI channel descriptors
-    /// for use with dynamically loaded processors.
-    pub fn into_ffi_channels(
-        self,
-    ) -> (
-        Vec<(String, RdfcChannel)>,
-        Vec<(String, RdfcChannel)>,
-    ) {
-        let reader_channels = self
+        let readers = self
             .readers
             .into_iter()
-            .map(|(name, reader)| {
-                let uri = reader.channel_uri().to_string();
-                (name, make_ffi_reader_channel(uri, reader))
+            .map(|(_, r)| {
+                let uri = r.channel_uri().to_string();
+                RawNamedReader {
+                    uri: RString::from(uri),
+                    reader: bridge_reader(r),
+                }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        let writer_channels = self
+        let writers = self
             .writers
             .into_iter()
-            .map(|(name, writer)| {
-                let uri = writer.channel_uri().to_string();
-                (name, make_ffi_writer_channel(uri, writer))
+            .map(|(_, w)| {
+                let uri = w.channel_uri().to_string();
+                RawNamedWriter {
+                    uri: RString::from(uri),
+                    writer: bridge_writer(w),
+                }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        (reader_channels, writer_channels)
+        rdfc_processor_sdk::RawProcessorArgs {
+            args_json: RString::from(serde_json::to_string(&self.args).unwrap_or_default()),
+            readers: RVec::from(readers),
+            writers: RVec::from(writers),
+        }
     }
 }
 

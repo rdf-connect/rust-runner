@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 use crate::channel::{Reader, ReaderMsg, ReaderRegistry, Writer, WriterAckRegistry};
 use crate::processor::{Processor, ProcessorContext};
 use crate::proto::rdfc::{
-    from_runner::Inner as FromRunnerInner, to_runner::Inner as ToRunnerInner,
-    FromRunner, ProcessorInitialized, RunnerIdentify,
+    from_runner::Inner as FromRunnerInner, to_runner::Inner as ToRunnerInner, FromRunner,
+    ProcessorInitialized, RunnerIdentify,
 };
 use crate::registry::{ProcessorConfig, ProcessorRegistry};
 
@@ -46,10 +46,7 @@ fn extract_channels(
                 .get("@type")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let id_str = map
-                .get("@id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            let id_str = map.get("@id").and_then(|v| v.as_str()).unwrap_or_default();
 
             // This object itself is a channel reference
             if type_str == RDFC_READER && !id_str.is_empty() {
@@ -120,10 +117,10 @@ pub struct RunnerState {
 }
 
 impl RunnerState {
-    pub fn new(
-        runner_uri: String,
-        orch_tx: mpsc::UnboundedSender<FromRunner>,
-    ) -> Self {
+    /// Create a new runner state. Processors are resolved on demand as `Proc`
+    /// messages arrive, by loading (and caching) the `cdylib` their
+    /// `config.file` points at — see [`crate::registry`].
+    pub fn new(runner_uri: String, orch_tx: mpsc::UnboundedSender<FromRunner>) -> Self {
         RunnerState {
             runner_uri,
             orch_tx,
@@ -154,7 +151,11 @@ impl RunnerState {
             }
 
             Some(ToRunnerInner::Msg(m)) => {
-                self.dispatch_msg(m.channel.clone(), Bytes::from(m.data), m.global_sequence_number);
+                self.dispatch_msg(
+                    m.channel.clone(),
+                    Bytes::from(m.data),
+                    m.global_sequence_number,
+                );
             }
 
             Some(ToRunnerInner::StreamMsg(sm)) => {
@@ -178,11 +179,7 @@ impl RunnerState {
             }
 
             Some(ToRunnerInner::Processed(ack)) => {
-                self.deliver_writer_ack(
-                    &ack.channel,
-                    ack.local_sequence_number,
-                    ack.error,
-                );
+                self.deliver_writer_ack(&ack.channel, ack.local_sequence_number, ack.error);
             }
 
             None => {
@@ -198,7 +195,7 @@ impl RunnerState {
         let uri = proc_msg.uri.clone();
         let result = self.try_setup_proc(proc_msg).await;
         if let Err(ref e) = result {
-            self.send_initialized(&uri, Some(e.to_string()));
+            self.send_initialized(&uri, Some(format!("{e:#}")));
         }
         result
     }
@@ -212,6 +209,14 @@ impl RunnerState {
 
         let args: serde_json::Value = serde_json::from_str(&proc_msg.arguments)
             .with_context(|| format!("parsing arguments for processor '{uri}'"))?;
+
+        // The processor's class URI (`@type` in the JSON-LD arguments) selects
+        // which exported `Registration` to run from the loaded `cdylib`.
+        let type_uri = args
+            .get("@type")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("processor '{uri}' arguments have no '@type'"))?
+            .to_string();
 
         // Extract channel URIs from JSON-LD arguments
         let mut reader_refs: Vec<(String, String)> = Vec::new(); // (field_name, channel_uri)
@@ -234,16 +239,16 @@ impl RunnerState {
 
         let ctx = ProcessorContext::new(uri.clone(), args, readers, writers);
 
-        // Instantiate (may compile the processor crate on first run)
+        // Instantiate (may compile/download the processor's cdylib on first run)
         let mut processor = self
             .proc_registry
-            .create(&config, ctx)
+            .create(&config, &type_uri, ctx)
             .await
             .with_context(|| format!("creating processor '{uri}'"))?;
 
         // Phase 1: init (awaited; signals readiness to orchestrator)
         if let Err(e) = processor.init().await {
-            self.send_initialized(&uri, Some(e.to_string()));
+            self.send_initialized(&uri, Some(format!("{e:#}")));
             return Ok(());
         }
 
@@ -256,7 +261,10 @@ impl RunnerState {
     // ── Start signal ──────────────────────────────────────────────────────────
 
     async fn start_processors(&mut self) {
-        info!("start signal received — launching {} processors", self.processors.len());
+        info!(
+            "start signal received — launching {} processors",
+            self.processors.len()
+        );
 
         // Each processor runs in its own task.
         // Within the task: transform() runs first (consuming channels), then produce().
@@ -359,9 +367,19 @@ impl RunnerState {
     }
 }
 
-// ── Top-level run() function ──────────────────────────────────────────────────
+// ── Top-level run() functions ─────────────────────────────────────────────────
 
-/// Connect to the orchestrator, run the protocol loop, and return when finished.
+/// Connect to the orchestrator.
+///
+/// Processors are discovered automatically via [`inventory`]: any processor
+/// crate linked into the binary via `use rdfc_processor_foo as _;` is
+/// registered at startup and will be found here.
+///
+/// # Example
+/// ```ignore
+/// // In your binary's main.rs:
+/// rdfc_rust_runner::run(addr, uri).await?;
+/// ```
 pub async fn run(addr: String, runner_uri: String) -> Result<()> {
     // Use tonic::client::Grpc directly so we can call `rpc connect` by its exact
     // URL path — the generated RunnerClient would produce E0592 because tonic also

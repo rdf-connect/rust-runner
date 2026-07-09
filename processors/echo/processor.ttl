@@ -1,0 +1,34 @@
+@prefix rdfc: <https://w3id.org/rdf-connect#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix :     <https://w3id.org/rdf-connect/rust#> .
+
+rdfc:EchoProcessor a rdfc:Processor ;
+    rdfs:label "Echo Processor" ;
+    :rustImplementationOf rdfc:Processor ;
+    :abiStable "rdfc-processor-sdk-0.1.0+abi_stable-0.11.3+async-ffi-0.5.0" ;
+    :artifact [
+        # Built locally via `cargo build --workspace --release`; path is
+        # relative to this file. A pipeline uses this processor by
+        # `owl:import`ing this file directly — see examples/echo-pipeline.
+        :targetTriple "x86_64-unknown-linux-gnu" ;
+        :path         <../../target/release/librdfc_processor_echo.so> ;
+        :sha256       "c5031cfc463b707ee9ea5eeeb21a5de32c61e45716d0d41e96edebdcd71a3fdc" ;
+    ] .
+
+[ ] a sh:NodeShape ;
+    sh:targetClass rdfc:EchoProcessor ;
+    sh:property [
+        sh:path rdfc:reader ;
+        sh:name "reader" ;
+        sh:class rdfc:Reader ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+    ] , [
+        sh:path rdfc:writer ;
+        sh:name "writer" ;
+        sh:class rdfc:Writer ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+    ] .

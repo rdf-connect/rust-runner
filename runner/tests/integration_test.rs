@@ -9,7 +9,17 @@
 //! The mock orchestrator routes messages between processors by reflecting
 //! `FromRunner::Msg` back as `ToRunner::Msg` + `ToRunner::Processed(LocalAck)`,
 //! and forwards channel closes so each downstream reader sees EOF.
+//!
+//! Processor discovery: there is no `rdfc:file` / `builtin://` special-casing
+//! — `proc.config` carries an `artifacts` list (as the orchestrator's SHACL
+//! shape in `runner/index.ttl` would extract from a processor's own
+//! `:artifact` declarations) naming a local `cdylib` path per target triple.
+//! This test builds `processors/{echo,log,send}` itself (via `cargo build`)
+//! and points each artifact entry straight at the resulting `.so`. The
+//! processor's class URI comes from `@type` in the JSON-LD arguments, not
+//! from `config`.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -139,11 +149,45 @@ impl Runner for MockOrchestrator {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn make_proc(uri: &str, file: &str, args_json: &str) -> ToRunner {
+/// Build `package` (a workspace member) and return the path to its `cdylib`
+/// — standing in for what a real pipeline author would do once, ahead of
+/// time, rather than relying on any runtime auto-compile.
+fn build_processor_so(package: &str, crate_name: &str) -> String {
+    let status = std::process::Command::new("cargo")
+        .args(["build", "-p", package])
+        .status()
+        .expect("failed to run cargo build — is cargo installed?");
+    assert!(status.success(), "cargo build failed for '{package}'");
+
+    let so_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/debug")
+        .join(format!("lib{crate_name}.so"));
+    assert!(
+        so_path.is_file(),
+        "expected '{}' to exist after building '{package}'",
+        so_path.display()
+    );
+    so_path.to_string_lossy().into_owned()
+}
+
+/// Build a `proc.config` JSON string carrying a single-target `artifacts`
+/// entry — what the orchestrator's SHACL shape (see `runner/index.ttl`)
+/// would extract from a processor's `:artifact` declaration. No `:sha256`,
+/// matching the "optional, for easier local testing" allowance.
+fn make_config(so_path: &str) -> String {
+    serde_json::json!({
+        "artifacts": [
+            { "target_triple": rdfc_rust_runner::registry::TARGET_TRIPLE, "path": so_path }
+        ]
+    })
+    .to_string()
+}
+
+fn make_proc(uri: &str, config_json: &str, args_json: &str) -> ToRunner {
     ToRunner {
         inner: Some(ToRunnerInner::Proc(Processor {
             uri: uri.to_string(),
-            config: format!(r#"{{"file":"{file}"}}"#),
+            config: config_json.to_string(),
             arguments: args_json.to_string(),
         })),
     }
@@ -179,10 +223,14 @@ async fn runner_full_lifecycle() {
         "reader": { "@type": "https://w3id.org/rdf-connect#Reader", "@id": ch2 }
     }).to_string();
 
+    let send_so = build_processor_so("rdfc-processor-send", "rdfc_processor_send");
+    let echo_so = build_processor_so("rdfc-processor-echo", "rdfc_processor_echo");
+    let log_so  = build_processor_so("rdfc-processor-log",  "rdfc_processor_log");
+
     let script = vec![
-        make_proc("http://example.org/sender", "builtin://send", &sender_args),
-        make_proc("http://example.org/echo",   "builtin://echo", &echo_args),
-        make_proc("http://example.org/log",    "builtin://log",  &log_args),
+        make_proc("http://example.org/sender", &make_config(&send_so), &sender_args),
+        make_proc("http://example.org/echo",   &make_config(&echo_so), &echo_args),
+        make_proc("http://example.org/log",    &make_config(&log_so),  &log_args),
         make_start(),
     ];
 
@@ -210,9 +258,12 @@ async fn runner_full_lifecycle() {
     // ── Start the runner ──────────────────────────────────────────────────────
     let runner_uri = "http://example.org/runner1";
     let runner_task = tokio::spawn(async move {
-        rdfc_rust_runner::run(addr.to_string(), runner_uri.to_string())
-            .await
-            .unwrap();
+        rdfc_rust_runner::run(
+            addr.to_string(),
+            runner_uri.to_string(),
+        )
+        .await
+        .unwrap();
     });
 
     // ── 1. Verify Identify ────────────────────────────────────────────────────

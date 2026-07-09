@@ -1,203 +1,382 @@
-//! Processor registry — maps type URIs to factories.
+//! Processor registry — resolves a processor's declared `:artifact` table to
+//! a loadable `cdylib`.
 //!
-//! Built-in processors are registered with `builtin://` file URIs.
-//! External processors are loaded from compiled shared libraries (`.so` / `.dylib`).
-//! If `config.file` points to a directory containing a `Cargo.toml`, the crate is
-//! compiled automatically before loading.
+//! There is no `rdfc:file` / `builtin://` special-casing: a pipeline that
+//! wants to use a processor simply `owl:import`s that processor's own
+//! `processor.ttl` (e.g. `processors/echo/processor.ttl` or
+//! `kolibrie-processor/processor.ttl`), which brings in both its argument
+//! shape and its `:abiStable`/`:artifact` declarations. The orchestrator's
+//! generic SHACL shape (targeting subjects of `:rustImplementationOf` — see
+//! `runner/index.ttl`) extracts those directly into `proc.config` as JSON;
+//! the runner never independently fetches or parses any Turtle itself.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::processor::{Processor, ProcessorContext};
 
-// Compile-time paths to the builtin processor crates, relative to this crate's manifest.
-const BUILTIN_PROCESSOR_DIRS: &[(&str, &str)] = &[
-    ("echo", concat!(env!("CARGO_MANIFEST_DIR"), "/../processors/echo")),
-    ("log",  concat!(env!("CARGO_MANIFEST_DIR"), "/../processors/log")),
-    ("send", concat!(env!("CARGO_MANIFEST_DIR"), "/../processors/send")),
-];
+/// This runner binary's own compiled target triple (e.g.
+/// `x86_64-unknown-linux-gnu`), baked in by `build.rs` from cargo's `TARGET`
+/// env var — not reconstructed from `std::env::consts::{OS, ARCH}`, which
+/// can't distinguish `gnu` vs `musl` libc or `msvc` vs `gnu` on Windows.
+pub const TARGET_TRIPLE: &str = env!("RDFC_TARGET_TRIPLE");
 
 // ── Config extracted from proc.config ─────────────────────────────────────────
 
-/// Runner-specific configuration for one processor definition.
-/// Extracted from `proc.config` (JSON-LD → plain JSON).
+/// One `(target triple) -> (path, optional checksum)` entry, as extracted by
+/// the orchestrator from a processor's `:artifact` declarations.
+#[derive(Debug, Deserialize)]
+pub struct Artifact {
+    pub target_triple: String,
+    /// Already resolved by the orchestrator — relative IRIs in `:artifact`
+    /// blocks resolve against wherever the declaring file was fetched from,
+    /// so this is always a usable local filesystem path or `http(s)://` URL,
+    /// never a bare relative reference.
+    pub path: String,
+    /// Omitted entirely for local development builds — when absent, the
+    /// artifact is loaded without a checksum check.
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// Runner-specific configuration for one processor definition, extracted
+/// from `proc.config` (JSON-LD → plain JSON) by the orchestrator's SHACL
+/// shape targeting subjects of `:rustImplementationOf`.
 #[derive(Debug, Deserialize)]
 pub struct ProcessorConfig {
-    /// `"builtin://<name>"` for built-in processors,  
-    /// or a filesystem path to a `.so` / Cargo project directory.
-    pub file: String,
-    /// Optional type identifier (only meaningful for multi-processor libraries).
+    /// The `:abiStable` token declared on the processor's class, if any.
+    /// Compared against `rdfc_processor_sdk::ABI_TOKEN` before attempting to
+    /// download or load anything, so an ABI mismatch is a clear error
+    /// instead of a failure deep inside `abi_stable`.
     #[serde(default)]
-    pub r#type: String,
+    pub abi_token: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
-/// Loads external `.so` processors on demand and auto-compiles Cargo projects.
-pub struct ProcessorRegistry {
-    /// Cache of already-loaded shared libraries (path → library handle).
-    loaded_libs: HashMap<PathBuf, libloading::Library>,
-}
+pub struct ProcessorRegistry;
 
 impl ProcessorRegistry {
     pub fn new() -> Self {
-        ProcessorRegistry {
-            loaded_libs: HashMap::new(),
-        }
+        ProcessorRegistry
     }
 
-    /// Create a processor instance from the runner config JSON and a prepared context.
+    /// Create a processor instance from the runner config, the processor's
+    /// class URI (from `@type` in the JSON-LD arguments), and a prepared context.
     pub async fn create(
-        &mut self,
+        &self,
         config: &ProcessorConfig,
+        type_uri: &str,
         ctx: ProcessorContext,
     ) -> Result<Box<dyn Processor>> {
-        if let Some(name) = config.file.strip_prefix("builtin://") {
-            let dir = BUILTIN_PROCESSOR_DIRS
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, dir)| *dir)
-                .ok_or_else(|| anyhow::anyhow!("unknown built-in processor '{name}'"))?;
-            let so_path = self.resolve_lib_async(dir).await?;
-            return self.load_dynamic(so_path, ctx);
-        }
-
-        // External shared library or Cargo project directory
-        let so_path = self.resolve_lib_async(&config.file).await?;
-        self.load_dynamic(so_path, ctx)
-    }
-
-    // ── private helpers ───────────────────────────────────────────────────────
-
-    /// Resolve the `.so` path, compiling a Cargo project if necessary.
-    /// Compilation is offloaded to a blocking thread so the async executor is not stalled.
-    async fn resolve_lib_async(&self, file: &str) -> Result<PathBuf> {
-        let path = PathBuf::from(file);
-
-        // Case 1: already a compiled shared library
-        if path.is_file() {
-            return Ok(path);
-        }
-
-        // Case 2: a directory (or Cargo.toml) → auto-compile
-        let manifest = if path.is_dir() {
-            path.join("Cargo.toml")
-        } else if path.file_name().map_or(false, |n| n == "Cargo.toml") {
-            path.clone()
-        } else {
-            bail!("processor file '{}' not found", file);
-        };
-
-        if !manifest.exists() {
-            bail!("no Cargo.toml found at '{}'", manifest.display());
-        }
-
-        // Return cached .so immediately if it already exists from a previous run.
-        let crate_dir = manifest.parent().unwrap_or(Path::new(".")).to_path_buf();
-        if let Some(so) = find_shared_lib(&crate_dir.join("target").join("release")) {
-            info!("using cached shared library: {}", so.display());
-            return Ok(so);
-        }
-
-        // Compile in a blocking thread — cargo can take seconds and must not
-        // block the async executor.
-        tokio::task::spawn_blocking(move || compile_crate(&manifest))
-            .await
-            .context("compile thread panicked")?
-    }
-
-    /// Load the `rdfc_run` symbol from a shared library and wrap it as a `Processor`.
-    fn load_dynamic(
-        &mut self,
-        so_path: PathBuf,
-        ctx: ProcessorContext,
-    ) -> Result<Box<dyn Processor>> {
-        // Load the shared library, keeping the handle alive in `loaded_libs`
-        // so the code stays mapped while the processor runs.
-        let lib = unsafe { libloading::Library::new(&so_path) }
-            .with_context(|| format!("loading '{}'", so_path.display()))?;
-
-        // Locate the `rdfc_run` entry point
-        type RunFn = unsafe extern "C" fn(*const rdfc_processor_sdk::RdfcArgs) -> i32;
-        let run_fn: libloading::Symbol<RunFn> = unsafe { lib.get(b"rdfc_run\0") }
-            .with_context(|| {
-                format!("symbol 'rdfc_run' not found in '{}'", so_path.display())
+        let artifact = config
+            .artifacts
+            .iter()
+            .find(|a| a.target_triple == TARGET_TRIPLE)
+            .ok_or_else(|| {
+                let available: Vec<&str> = config
+                    .artifacts
+                    .iter()
+                    .map(|a| a.target_triple.as_str())
+                    .collect();
+                anyhow::anyhow!(
+                    "processor '{type_uri}' has no prebuilt artifact for this runner's target \
+                     '{TARGET_TRIPLE}' (it offers: {})",
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                )
             })?;
-        // Extend lifetime — the Library is kept alive in `loaded_libs`.
-        let run_fn: RunFn = unsafe { std::mem::transmute(run_fn.into_raw()) };
 
-        self.loaded_libs.entry(so_path).or_insert(lib);
+        check_abi_token(config.abi_token.as_deref(), type_uri)?;
 
-        Ok(Box::new(DynamicProcessor::new(run_fn, ctx)))
+        let so_path = resolve_artifact(artifact)
+            .await
+            .with_context(|| format!("resolving artifact for processor '{type_uri}'"))?;
+        load_dynamic(&so_path, type_uri, ctx)
     }
 }
 
-// ── Auto-compile helper ───────────────────────────────────────────────────────
+impl Default for ProcessorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-/// Find the first `.so` / `.dylib` / `.dll` in `dir`.
-fn find_shared_lib(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if (name.starts_with("lib") && name.ends_with(".so"))
-            || name.ends_with(".dylib")
-            || (name.ends_with(".dll") && !name.ends_with(".dll.exp"))
-        {
-            return Some(entry.path());
+fn check_abi_token(abi_token: Option<&str>, type_uri: &str) -> Result<()> {
+    if let Some(token) = abi_token {
+        if token != rdfc_processor_sdk::ABI_TOKEN {
+            bail!(
+                "processor '{type_uri}' was built against abi token '{token}', but this runner \
+                 expects '{}' — rebuild the processor against a matching rdfc-processor-sdk version",
+                rdfc_processor_sdk::ABI_TOKEN
+            );
         }
     }
-    None
+    Ok(())
 }
 
-/// Run `cargo build --release` on the crate at `manifest` and return the path
-/// to the resulting shared library.
-fn compile_crate(manifest: &Path) -> Result<PathBuf> {
-    info!("compiling processor crate at '{}'", manifest.display());
+// ── Artifact resolution (local path or http(s) download + cache) ─────────────
 
-    let crate_dir = manifest.parent().unwrap_or(Path::new("."));
-    // Use the crate's own target dir so the .so is always in a known place,
-    // even when the crate lives inside a Cargo workspace that redirects output.
-    let target_dir = crate_dir.join("target");
-
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "--manifest-path"])
-        .arg(manifest)
-        .arg("--target-dir")
-        .arg(&target_dir)
-        .status()
-        .context("cargo build failed to start — is cargo installed?")?;
-
-    if !status.success() {
-        bail!("cargo build failed for '{}'", manifest.display());
+async fn resolve_artifact(artifact: &Artifact) -> Result<PathBuf> {
+    if artifact.path.starts_with("http://") || artifact.path.starts_with("https://") {
+        return resolve_remote(artifact).await;
     }
 
-    let release_dir = target_dir.join("release");
+    // The orchestrator hands relative `:path` IRIs back already resolved to
+    // absolute IRIs — for a local file that means a `file://` URI, not a
+    // bare filesystem path. Accept both: `file://` URIs (the real-world
+    // case, coming from the orchestrator's SHACL extraction) and plain paths
+    // (e.g. constructed directly in tests, or written by hand).
+    let path = if let Some(rest) = artifact.path.strip_prefix("file://") {
+        reqwest::Url::parse(&artifact.path)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .unwrap_or_else(|| PathBuf::from(rest))
+    } else {
+        PathBuf::from(&artifact.path)
+    };
 
-    find_shared_lib(&release_dir).ok_or_else(|| {
-        anyhow::anyhow!("no shared library found in '{}' after build", release_dir.display())
-    })
+    resolve_local(artifact, path).await
 }
 
-// ── DynamicProcessor ─────────────────────────────────────────────────────────
+async fn resolve_local(artifact: &Artifact, path: PathBuf) -> Result<PathBuf> {
+    if !path.is_file() {
+        bail!("processor artifact '{}' not found", path.display());
+    }
+    if let Some(expected) = &artifact.sha256 {
+        verify_checksum(&path, expected)
+            .await
+            .with_context(|| format!("verifying '{}'", path.display()))?;
+    }
+    Ok(path)
+}
 
-use rdfc_processor_sdk::{RdfcArgs, RdfcNamedChannel};
+async fn resolve_remote(artifact: &Artifact) -> Result<PathBuf> {
+    let url = reqwest::Url::parse(&artifact.path)
+        .with_context(|| format!("invalid artifact URL '{}'", artifact.path))?;
 
-type RunFn = unsafe extern "C" fn(*const RdfcArgs) -> i32;
+    let cache_path = cache_path_for(artifact);
+    if cache_path.is_file() {
+        let usable = match &artifact.sha256 {
+            Some(expected) => checksum_matches(&cache_path, expected).await,
+            None => true,
+        };
+        if usable {
+            info!("using cached processor artifact: {}", cache_path.display());
+            return Ok(cache_path);
+        }
+    }
 
-/// Wraps a dynamically-loaded `rdfc_run` function as an async `Processor`.
+    info!("downloading processor artifact from '{url}'");
+    download(&url, &cache_path).await?;
+    if let Some(expected) = &artifact.sha256 {
+        verify_checksum(&cache_path, expected)
+            .await
+            .with_context(|| format!("verifying downloaded artifact '{}'", cache_path.display()))?;
+    }
+    Ok(cache_path)
+}
+
+// ── Checksums + cache ──────────────────────────────────────────────────────────
+
+fn cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("rdfc-runner")
+        .join("processors")
+}
+
+/// Cache key: prefer the checksum (content-addressed, safe to keep forever);
+/// fall back to hashing the URL itself when no `:sha256` was given (always
+/// re-verified against nothing, so this only dedupes repeated downloads
+/// within a run/host, it doesn't guarantee freshness).
+fn cache_path_for(artifact: &Artifact) -> PathBuf {
+    let filename = Path::new(&artifact.path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("processor");
+    let key_source = artifact.sha256.as_deref().unwrap_or(&artifact.path);
+    let key = to_hex(&Sha256::digest(key_source.as_bytes()));
+    cache_dir().join(format!("{key}-{filename}"))
+}
+
+async fn sha256_file(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        use std::io::Read;
+
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("opening '{}'", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("reading '{}'", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(to_hex(&hasher.finalize()))
+    })
+    .await
+    .context("checksum thread panicked")?
+}
+
+async fn verify_checksum(path: &Path, expected_sha256: &str) -> Result<()> {
+    let actual = sha256_file(path).await?;
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        bail!(
+            "checksum mismatch for '{}': manifest declares {expected_sha256}, computed {actual}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn checksum_matches(path: &Path, expected_sha256: &str) -> bool {
+    sha256_file(path)
+        .await
+        .map(|actual| actual.eq_ignore_ascii_case(expected_sha256))
+        .unwrap_or(false)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+async fn download(url: &reqwest::Url, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating cache directory '{}'", parent.display()))?;
+    }
+    let bytes = reqwest::get(url.clone())
+        .await
+        .and_then(|r| r.error_for_status())
+        .with_context(|| format!("downloading '{url}'"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading download body from '{url}'"))?;
+
+    // Write to a temp file first so a crash mid-download can't leave a
+    // corrupt file at `dest` that a later checksum check would wrongly trust.
+    let tmp = dest.with_extension("part");
+    tokio::fs::write(&tmp, &bytes)
+        .await
+        .with_context(|| format!("writing '{}'", tmp.display()))?;
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .with_context(|| format!("finalizing '{}'", dest.display()))?;
+    Ok(())
+}
+
+// ── Loading + DynamicProcessor ────────────────────────────────────────────────
+
+/// Load `so_path` via `abi_stable`, find the registration for `type_uri`, and
+/// wrap it as a [`Processor`].
+///
+/// This deliberately does *not* use `ProcessorModuleRef::load_from_file` —
+/// that API caches the loaded root module in a `static` keyed by the Rust
+/// *type* `ProcessorModuleRef`, on the assumption that one Rust type
+/// corresponds to exactly one dynamic library. Here every processor cdylib
+/// shares that same type, so the first `load_from_file` call would poison
+/// all subsequent ones with its own (wrong) module. Instead, each `.so` is
+/// loaded and its root module extracted independently via the lower-level
+/// `RawLibrary` / `LibHeader` API, which does the same version + type-layout
+/// checks without any cross-library caching.
+fn load_dynamic(so_path: &Path, type_uri: &str, ctx: ProcessorContext) -> Result<Box<dyn Processor>> {
+    use rdfc_processor_sdk::abi_stable::library::{lib_header_from_raw_library, RawLibrary};
+
+    let raw_lib = RawLibrary::load_at(so_path).map_err(|e| {
+        anyhow::anyhow!("failed to load processor library '{}': {e}", so_path.display())
+    })?;
+    // Leaked deliberately: the returned root module borrows `'static` from
+    // the library, and we never unload processor libraries once loaded.
+    let raw_lib: &'static RawLibrary = Box::leak(Box::new(raw_lib));
+
+    let lib_header = unsafe { lib_header_from_raw_library(raw_lib) }.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read processor library header for '{}': {e}\n\n\
+             This usually means the library was built against a different \
+             `abi_stable` version than this runner expects.",
+            so_path.display()
+        )
+    })?;
+
+    let root: rdfc_processor_sdk::ProcessorModuleRef = lib_header.init_root_module().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load processor module from '{}': {e}\n\n\
+             This usually means the library was built against a different \
+             `abi_stable`/Rust compiler version than this runner, or the \
+             file is corrupt. Rebuild the processor against the pinned \
+             `rdfc-processor-sdk` version and try again.",
+            so_path.display()
+        )
+    })?;
+
+    let registrations = (root.registrations())();
+    let registration = registrations
+        .iter()
+        .find(|r| r.type_uri.as_str() == type_uri)
+        .ok_or_else(|| {
+            let available: Vec<&str> = registrations.iter().map(|r| r.type_uri.as_str()).collect();
+            anyhow::anyhow!(
+                "'{}' does not export a processor for '{type_uri}' (it exports: {})",
+                so_path.display(),
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )
+        })?;
+
+    Ok(Box::new(DynamicProcessor::new(registration.factory, ctx)))
+}
+
+/// Wraps a loaded processor's `factory` fn as an async [`Processor`].
 struct DynamicProcessor {
-    run_fn: RunFn,
+    factory: extern "C" fn(
+        rdfc_processor_sdk::RawProcessorArgs,
+    ) -> rdfc_processor_sdk::async_ffi::FfiFuture<
+        rdfc_processor_sdk::abi_stable::std_types::RResult<
+            (),
+            rdfc_processor_sdk::abi_stable::std_types::RString,
+        >,
+    >,
     ctx: Option<ProcessorContext>, // taken in produce()
 }
 
 impl DynamicProcessor {
-    fn new(run_fn: RunFn, ctx: ProcessorContext) -> Self {
+    fn new(
+        factory: extern "C" fn(
+            rdfc_processor_sdk::RawProcessorArgs,
+        ) -> rdfc_processor_sdk::async_ffi::FfiFuture<
+            rdfc_processor_sdk::abi_stable::std_types::RResult<
+                (),
+                rdfc_processor_sdk::abi_stable::std_types::RString,
+            >,
+        >,
+        ctx: ProcessorContext,
+    ) -> Self {
         DynamicProcessor {
-            run_fn,
+            factory,
             ctx: Some(ctx),
         }
     }
@@ -213,79 +392,22 @@ impl Processor for DynamicProcessor {
         Ok(())
     }
 
-    /// Run the processor's `rdfc_run` in a dedicated OS thread.
-    /// The function calls blocking SDK read/write operations; running it on a
-    /// tokio thread pool thread would exhaust the pool, so we use `spawn_blocking`.
+    /// Run the processor by calling its exported factory and awaiting the
+    /// returned `FfiFuture` directly — no dedicated OS thread needed, since
+    /// polling an `FfiFuture` just calls back into the (already-loaded)
+    /// processor's own compiled code.
     async fn produce(&mut self) -> Result<()> {
         let ctx = self
             .ctx
             .take()
             .ok_or_else(|| anyhow::anyhow!("DynamicProcessor.produce() called twice"))?;
 
-        let run_fn = self.run_fn;
-
-        tokio::task::spawn_blocking(move || run_dynamic(run_fn, ctx))
-            .await
-            .context("dynamic processor thread panicked")??;
-
-        Ok(())
+        let raw_args = ctx.into_raw_args();
+        match (self.factory)(raw_args).await {
+            rdfc_processor_sdk::abi_stable::std_types::RResult::ROk(()) => Ok(()),
+            rdfc_processor_sdk::abi_stable::std_types::RResult::RErr(e) => {
+                bail!("processor returned an error: {e}")
+            }
+        }
     }
-}
-
-/// Build the `RdfcArgs` struct, call `rdfc_run`, and clean up.
-fn run_dynamic(run_fn: RunFn, ctx: ProcessorContext) -> Result<()> {
-    use crate::channel::{drop_ffi_reader_channel, drop_ffi_writer_channel};
-
-    let args_json = serde_json::to_vec(&ctx.args).unwrap_or_default();
-
-    let (reader_channels, writer_channels) = ctx.into_ffi_channels();
-
-    // Build RdfcNamedChannel slices, leaking name strings for the FFI boundary.
-    let ffi_readers: Vec<RdfcNamedChannel> = reader_channels
-        .into_iter()
-        .map(|(name, ch)| {
-            let name_bytes = name.into_bytes().into_boxed_slice();
-            let name_ptr = name_bytes.as_ptr();
-            let name_len = name_bytes.len();
-            std::mem::forget(name_bytes);
-            RdfcNamedChannel { name: name_ptr, name_len, channel: ch }
-        })
-        .collect();
-
-    let ffi_writers: Vec<RdfcNamedChannel> = writer_channels
-        .into_iter()
-        .map(|(name, ch)| {
-            let name_bytes = name.into_bytes().into_boxed_slice();
-            let name_ptr = name_bytes.as_ptr();
-            let name_len = name_bytes.len();
-            std::mem::forget(name_bytes);
-            RdfcNamedChannel { name: name_ptr, name_len, channel: ch }
-        })
-        .collect();
-
-    let ffi_args = RdfcArgs {
-        args_json: args_json.as_ptr(),
-        args_json_len: args_json.len(),
-        readers: ffi_readers.as_ptr(),
-        n_readers: ffi_readers.len(),
-        writers: ffi_writers.as_ptr(),
-        n_writers: ffi_writers.len(),
-    };
-
-    let rc = unsafe { run_fn(&ffi_args) };
-
-    // Free all leaked FFI state so `orch_tx` clones are dropped and the
-    // gRPC outbound stream can see EOF once all processors finish.
-    for nc in ffi_readers {
-        let name = unsafe { Vec::from_raw_parts(nc.name as *mut u8, nc.name_len, nc.name_len) };
-        drop(name);
-        unsafe { drop_ffi_reader_channel(nc.channel) };
-    }
-    for nc in ffi_writers {
-        let name = unsafe { Vec::from_raw_parts(nc.name as *mut u8, nc.name_len, nc.name_len) };
-        drop(name);
-        unsafe { drop_ffi_writer_channel(nc.channel) };
-    }
-
-    if rc == 0 { Ok(()) } else { bail!("rdfc_run returned error code {rc}") }
 }

@@ -7,3 +7,11 @@ members = [
     "processors/send",
 ]
 resolver = "2"
+
+# Pinned exactly: the abi_stable / async-ffi versions here define the plugin
+# ABI. The runner and every processor cdylib must be built against the exact
+# same versions, or `abi_stable`'s layout check will refuse to load the
+# library (see processor-sdk's ABI_TOKEN doc comment).
+[workspace.dependencies]
+abi_stable = "=0.11.3"
+async-ffi = "=0.5.0"

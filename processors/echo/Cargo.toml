@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "rlib"]  # rlib enables `cargo test`
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rdfc-processor-sdk = { path = "../../processor-sdk" }
 serde = { version = "1", features = ["derive"] }
+# `abi_stable`'s `#[export_root_module]` macro expands to code with an
+# absolute `::abi_stable::...` path, so it must be a direct dependency here
+# even though `rdfc-processor-sdk` re-exports the crate.
+abi_stable = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }

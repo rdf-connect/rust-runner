@@ -9,106 +9,50 @@ rdfc:RustRunner a rdfc:Runner;
   rdfc:handlesSubjectsOf :rustImplementationOf;
   rdfc:command "rust-runner".
 
-# ── Shape: what the runner expects per processor definition ──────────────────
-# Extracted from proc.config JSON-LD by the orchestrator.
+# ── Processor config shape ─────────────────────────────────────────────────────
+#
+# Applies generically to every class that opts into the Rust runner via
+# `:rustImplementationOf rdfc:Processor` — there is no per-processor
+# declaration here. A processor's own `processor.ttl` (see e.g.
+# processors/echo/processor.ttl or kolibrie-processor/processor.ttl) declares
+# its `:abiStable` token and `:artifact` list on its own class; a pipeline
+# picks up both that data *and* the processor's argument shape simply by
+# `owl:import`ing that file — nothing else is needed.
+#
+# The orchestrator resolves `:path` (declared as an IRI in each `:artifact`
+# entry, so relative references resolve against wherever the enclosing file
+# was fetched from) but hands it to the runner as a plain string — see the
+# `sh:datatype xsd:string` below despite `:path`'s value being an IRI.
 [ ] a sh:NodeShape;
   sh:targetSubjectsOf :rustImplementationOf;
   sh:property [
-    sh:path rdfc:file;
-    sh:name "file";
-    sh:minCount 1;
-    sh:maxCount 1;
-    sh:datatype xsd:anyURI;
-    sh:description "Path to a .so/.dylib, a Cargo project directory, or 'builtin://<name>'.";
-  ], [
-    sh:path rdfc:type;
-    sh:name "type";
+    sh:path :abiStable;
+    sh:name "abi_token";
     sh:maxCount 1;
     sh:datatype xsd:string;
-    sh:description "Optional type name within the shared library (unused for builtins).";
+  ], [
+    sh:path :artifact;
+    sh:name "artifacts";
+    sh:class :Artifact;
   ].
 
-# ── Built-in processor: EchoProcessor ────────────────────────────────────────
-rdfc:EchoProcessor :rustImplementationOf rdfc:Processor;
-  rdfc:file <builtin://echo>.
-
 [ ] a sh:NodeShape;
-  sh:targetClass rdfc:EchoProcessor;
+  sh:targetClass :Artifact;
   sh:property [
-    sh:path rdfc:reader;
-    sh:name "reader";
-    sh:class rdfc:Reader;
-    sh:minCount 1;
-    sh:maxCount 1;
-  ], [
-    sh:path rdfc:writer;
-    sh:name "writer";
-    sh:class rdfc:Writer;
-    sh:minCount 1;
-    sh:maxCount 1;
-  ].
-
-# ── Built-in processor: LogProcessor ─────────────────────────────────────────
-rdfc:LogProcessor :rustImplementationOf rdfc:Processor;
-  rdfc:file <builtin://log>.
-
-[ ] a sh:NodeShape;
-  sh:targetClass rdfc:LogProcessor;
-  sh:property [
-    sh:path rdfc:reader;
-    sh:name "reader";
-    sh:class rdfc:Reader;
-    sh:minCount 1;
-    sh:maxCount 1;
-  ], [
-    sh:path rdfc:label;
-    sh:name "label";
-    sh:maxCount 1;
+    sh:path :targetTriple;
+    sh:name "target_triple";
     sh:datatype xsd:string;
-  ].
-
-# ── Built-in processor: SendProcessor ────────────────────────────────────────
-rdfc:SendProcessor :rustImplementationOf rdfc:Processor;
-  rdfc:file <builtin://send>.
-
-[ ] a sh:NodeShape;
-  sh:targetClass rdfc:SendProcessor;
-  sh:property [
-    sh:path rdfc:writer;
-    sh:name "writer";
-    sh:class rdfc:Writer;
     sh:minCount 1;
     sh:maxCount 1;
   ], [
-    sh:path rdfc:msg;
-    sh:name "msgs";
+    sh:path :path;
+    sh:name "path";
     sh:datatype xsd:string;
+    sh:minCount 1;
+    sh:maxCount 1;
+  ], [
+    sh:path :sha256;
+    sh:name "sha256";
+    sh:datatype xsd:string;
+    sh:maxCount 1;
   ].
-
-# ── Example pipeline using only Rust processors ───────────────────────────────
-# 
-# @prefix owl: <http://www.w3.org/2002/07/owl#>.
-# @prefix rdfc: <https://w3id.org/rdf-connect#>.
-# 
-# <> owl:imports <https://w3id.org/rdf-connect/rust/index.ttl>.
-# 
-<> a rdfc:Pipeline;
-  rdfc:consistsOf [
-    rdfc:instantiates rdfc:RustRunner;
-    rdfc:processor <sender>, <echo>, <log>;
-  ].
-
-<ch1> a rdfc:Writer, rdfc:Reader .
-<ch2> a rdfc:Writer, rdfc:Reader .
-
-<sender> a rdfc:SendProcessor ;
-    rdfc:writer <ch1> ;
-    rdfc:msg "hello", "world" .
-
-<echo> a rdfc:EchoProcessor ;
-    rdfc:reader <ch1> ;
-    rdfc:writer <ch2> .
-
-<log> a rdfc:LogProcessor ;
-    rdfc:reader <ch2> .
-

@@ -1,0 +1,33 @@
+@prefix rdfc: <https://w3id.org/rdf-connect#>.
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
+@prefix sh: <http://www.w3.org/ns/shacl#>.
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#>.
+@prefix : <https://w3id.org/rdf-connect/rust#>.
+
+rdfc:SendProcessor a rdfc:Processor;
+  rdfs:label "Send Processor";
+  :rustImplementationOf rdfc:Processor;
+  :abiStable "rdfc-processor-sdk-0.1.0+abi_stable-0.11.3+async-ffi-0.5.0";
+  :artifact [
+    # Built locally via `cargo build --workspace --release`; path is
+    # relative to this file. A pipeline uses this processor by
+    # `owl:import`ing this file directly — see examples/echo-pipeline.
+    :targetTriple "x86_64-unknown-linux-gnu";
+    :path <../../target/release/librdfc_processor_send.so>;
+    :sha256 "726ca16ea7888bc9cb080fc384bab98bca6056d46e8efa23e4289c9f38c3d4ef";
+  ].
+
+[ ] a sh:NodeShape;
+  sh:targetClass rdfc:SendProcessor;
+  sh:property [
+    sh:path rdfc:writer;
+    sh:name "writer";
+    sh:class rdfc:Writer;
+    sh:minCount 1;
+    sh:maxCount 1;
+  ], [
+    sh:path rdfc:msg;
+    sh:name "msgs";
+    sh:datatype xsd:string;
+  ].
+

@@ -1,6 +1,7 @@
 //! Send processor — writes a predefined list of messages from args then closes.
 
-use rdfc_processor_sdk::*;
+use rdfc_processor_sdk::{ProcessorArgs, Writer};
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Config {
@@ -9,7 +10,8 @@ struct Config {
     msgs: Vec<String>,
 }
 
-async fn send_proc(Config { writer, msgs }: Config) -> Result<(), String> {
+pub async fn send_proc(mut args: ProcessorArgs) -> Result<(), String> {
+    let Config { writer, msgs } = args.deserialize()?;
     for msg in &msgs {
         writer.write_str(msg).await?;
     }
@@ -17,53 +19,45 @@ async fn send_proc(Config { writer, msgs }: Config) -> Result<(), String> {
     Ok(())
 }
 
-rdfc_export!(send_proc);
+rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#SendProcessor", send_proc);
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use rdfc_processor_sdk::testing::*;
-    use rdfc_processor_sdk::RdfcArgs;
+    use rdfc_processor_sdk::make_writer;
+    use serde_json::json;
 
-    fn run_send(extra_json: &str) -> (Vec<Vec<u8>>, bool) {
-        let (writer_state, writer_ch) = make_mock_writer("mock://writer");
-        let writer_nc = make_named("writer", writer_ch);
-
-        let args_json = format!(
-            r#"{{"writer":{{"@type":"https://w3id.org/rdf-connect#Writer","@id":"mock://writer"}},{}}}"#,
-            extra_json
+    async fn run_send(msgs: serde_json::Value) -> (Vec<Vec<u8>>, bool) {
+        let (writer, bridge) = make_writer("mock://writer".to_string());
+        let args = make_test_args(
+            json!({
+                "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"},
+                "msgs": msgs
+            }),
+            [],
+            [("writer", writer)],
         );
-        let args_bytes = args_json.as_bytes().to_vec();
-
-        let ffi_args = RdfcArgs {
-            args_json: args_bytes.as_ptr(),
-            args_json_len: args_bytes.len(),
-            readers: std::ptr::NonNull::dangling().as_ptr(),
-            n_readers: 0,
-            writers: &writer_nc,
-            n_writers: 1,
-        };
-
-        assert_eq!(unsafe { super::rdfc_run(&ffi_args) }, 0);
-
-        let received = writer_state.received.lock().unwrap().clone();
-        let closed = *writer_state.closed.lock().unwrap();
-        (received, closed)
+        let (result, collected) = tokio::join!(super::send_proc(args), collect_writer(bridge));
+        result.unwrap();
+        collected
     }
 
-    #[test]
-    fn send_emits_array_messages() {
-        let (received, closed) = run_send(r#""msgs":["alpha","beta","gamma"]"#);
-        assert_eq!(received, vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
+    #[tokio::test]
+    async fn send_emits_array_messages() {
+        let (received, closed) = run_send(json!(["alpha", "beta", "gamma"])).await;
+        assert_eq!(
+            received,
+            vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+        );
         assert!(closed);
     }
 
-    #[test]
-    fn send_no_messages_closes_writer() {
-        let (received, closed) = run_send(r#""msgs":[]"#);
+    #[tokio::test]
+    async fn send_no_messages_closes_writer() {
+        let (received, closed) = run_send(json!([])).await;
         assert!(received.is_empty());
         assert!(closed);
     }
 }
-

@@ -1,0 +1,46 @@
+@prefix owl: <http://www.w3.org/2002/07/owl#>.
+@prefix rdfc: <https://w3id.org/rdf-connect#>.
+@prefix : <https://w3id.org/rdf-connect/rust#>.
+
+# ── Import the runner + each processor's own file ─────────────────────────────
+# The orchestrator resolves these relative to this file, just like the JS
+# ecosystem resolves node_modules.
+#
+# - runner/index.ttl: the `rdfc:RustRunner` definition, plus the generic SHACL
+#   shape (targeting subjects of `:rustImplementationOf`) that extracts a
+#   processor's `:abiStable`/`:artifact` declarations into `proc.config`.
+# - each processors/*/processor.ttl: the processor's class, its own argument
+#   shape, and its `:artifact` table. There is no `rdfc:file` anywhere — using
+#   a processor is just `owl:import`ing its processor.ttl.
+<> owl:imports <../../runner/index.ttl>.
+<> owl:imports <../../processors/send/processor.ttl>.
+<> owl:imports <../../processors/echo/processor.ttl>.
+<> owl:imports <../../processors/log/processor.ttl>.
+
+# ── Runner definition ─────────────────────────────────────────────────────────
+rdfc:RustRunner2 a rdfc:Runner;
+  rdfc:handlesSubjectsOf :rustImplementationOf;
+  rdfc:command "../../target/release/rust-runner".
+
+<> a rdfc:Pipeline;
+  rdfc:consistsOf [
+    rdfc:instantiates rdfc:RustRunner2;
+    rdfc:processor <sender>, <echo>, <log>;
+  ].
+
+# Channels
+<ch1> a rdfc:Writer, rdfc:Reader.
+
+<ch2> a rdfc:Writer, rdfc:Reader.
+# Processors
+<sender> a rdfc:SendProcessor;
+  rdfc:writer <ch1>;
+  rdfc:msg "Hello from the Rust runner!", "Second message.".
+
+<echo> a rdfc:EchoProcessor;
+  rdfc:reader <ch1>;
+  rdfc:writer <ch2>.
+
+<log> a rdfc:LogProcessor;
+  rdfc:reader <ch2>;
+  rdfc:label "echo-pipeline".
