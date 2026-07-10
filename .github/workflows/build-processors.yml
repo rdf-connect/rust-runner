@@ -66,10 +66,10 @@ jobs:
           echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr '[:lower:]-' '[:upper:]_')_LINKER=${{ matrix.cross_linker }}" >> "$GITHUB_ENV"
 
       - name: Build rdfc-processor-buildtools (host target)
-        run: cargo build --release --manifest-path processor-buildtools/Cargo.toml
+        run: cargo build --release -p rdfc-processor-buildtools
 
       - name: Add buildtools to PATH
-        run: echo "$GITHUB_WORKSPACE/processor-buildtools/target/release" >> "$GITHUB_PATH"
+        run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
 
       - name: Discover processor crates
         id: discover
@@ -139,9 +139,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build rdfc-processor-buildtools
-        run: cargo build --release --manifest-path processor-buildtools/Cargo.toml
+        run: cargo build --release -p rdfc-processor-buildtools
 
-      - run: echo "$GITHUB_WORKSPACE/processor-buildtools/target/release" >> "$GITHUB_PATH"
+      - run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
 
       - uses: actions/download-artifact@v4
         with:
