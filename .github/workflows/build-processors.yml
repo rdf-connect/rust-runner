@@ -41,9 +41,6 @@ jobs:
             ext: so
             cross_linker: aarch64-linux-gnu-gcc
             cross_apt_package: gcc-aarch64-linux-gnu
-          - target: x86_64-apple-darwin
-            os: macos-13
-            ext: dylib
           - target: aarch64-apple-darwin
             os: macos-14
             ext: dylib
