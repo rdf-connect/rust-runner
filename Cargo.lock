@@ -1032,6 +1032,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "linkme"
+version = "0.3.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e83272d46373fb8decca684579ac3e7c8f3d71d4cc3aa693df8759e260ae41cf"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32d59e20403c7d08fe62b4376edfe5c7fb2ef1e6b1465379686d0f21c8df444b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1134,6 +1154,46 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "oxilangtag"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d3b4eb570abd4a1dcb062c31fd37b832264d9dc7292c3e69acfe926c87b063f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "oxiri"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54b4ed3a7192fa19f5f48f99871f2755047fabefd7f222f12a1df1773796a102"
+
+[[package]]
+name = "oxrdf"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0afd5c28e4a399c57ee2bc3accd40c7b671fdc7b6537499f14e95b265af7d7e0"
+dependencies = [
+ "oxilangtag",
+ "oxiri",
+ "rand 0.8.6",
+ "thiserror",
+]
+
+[[package]]
+name = "oxttl"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f03fd471bd54c23d76631c0a2677aa4bb308d905f6e491ee35dcb0732b7c5c6c"
+dependencies = [
+ "memchr",
+ "oxilangtag",
+ "oxiri",
+ "oxrdf",
+ "thiserror",
+]
 
 [[package]]
 name = "parking_lot"
@@ -1430,10 +1490,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdfc-processor-buildtools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "oxrdf",
+ "oxttl",
+ "rdfc-processor-sdk",
+ "sha2",
+]
+
+[[package]]
 name = "rdfc-processor-echo"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "rdfc-processor-buildtools",
  "rdfc-processor-sdk",
  "serde",
  "serde_json",
@@ -1445,6 +1517,19 @@ name = "rdfc-processor-log"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "rdfc-processor-buildtools",
+ "rdfc-processor-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rdfc-processor-multi"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "rdfc-processor-buildtools",
  "rdfc-processor-sdk",
  "serde",
  "serde_json",
@@ -1459,6 +1544,7 @@ dependencies = [
  "async-ffi",
  "bytes",
  "futures",
+ "linkme",
  "serde",
  "serde_json",
  "tokio",
@@ -1469,6 +1555,7 @@ name = "rdfc-processor-send"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "rdfc-processor-buildtools",
  "rdfc-processor-sdk",
  "serde",
  "serde_json",

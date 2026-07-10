@@ -1,10 +1,12 @@
 [workspace]
 members = [
     "processor-sdk",
+    "processor-buildtools",
     "runner",
     "processors/echo",
     "processors/log",
     "processors/send",
+    "processors/multi",
 ]
 resolver = "2"
 

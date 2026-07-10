@@ -198,6 +198,36 @@ references against wherever the file was fetched from) but typed
 `xsd:string` in the shape, so the runner receives an already-absolute path
 or URL as a plain string.
 
+### You don't hand-write `:abiStable` / `:artifact`
+
+Hand-maintaining a real path and checksum in `processor.ttl` would go stale
+on every rebuild, so don't — `rdfc-processor-buildtools` generates them:
+
+```rust
+// build.rs
+fn main() {
+    rdfc_processor_buildtools::generate(&["processor.ttl"]).unwrap();
+}
+```
+
+Your checked-in `processor.ttl` just does `<> owl:imports <generated.ttl>.`
+once (see `processors/echo/processor.ttl`); `generated.ttl` itself is
+gitignored and rewritten by every `cargo build`, always pointing at *this*
+build's own compiled `cdylib` (no `:sha256` — the artifact doesn't exist yet
+when `build.rs` runs, so local dev just trusts it). A real, checksummed,
+multi-target-triple release is a separate, genuinely post-build concern —
+see `kolibrie-processor/.github/workflows/build-processor.yml` and
+`rdfc-processor-buildtools`'s own CLI (`checksum`, `snippet`, `merge`,
+`flatten`) for how CI builds one.
+
+### One `cdylib` can export several processors
+
+Call [`rdfc_register!`] as many times as you like in one crate — once per
+processor — followed by exactly one `rdfc_export_processors!()` (a `cdylib`
+can only have one root-module export; see its docs for why). If several of
+those classes are declared in the same source file with one
+`owl:imports`, `generate()` writes all their data into that one target.
+
 Example pipeline TTL:
 
 ```turtle

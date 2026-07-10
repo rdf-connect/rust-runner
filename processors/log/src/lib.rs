@@ -23,6 +23,7 @@ pub async fn log_proc(mut args: ProcessorArgs) -> Result<(), String> {
 }
 
 rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#LogProcessor", log_proc);
+rdfc_processor_sdk::rdfc_export_processors!();
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

@@ -20,6 +20,7 @@ pub async fn send_proc(mut args: ProcessorArgs) -> Result<(), String> {
 }
 
 rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#SendProcessor", send_proc);
+rdfc_processor_sdk::rdfc_export_processors!();
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

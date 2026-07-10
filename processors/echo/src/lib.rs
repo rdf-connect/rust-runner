@@ -21,12 +21,14 @@ pub async fn echo(mut args: ProcessorArgs) -> Result<(), String> {
 
 rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#EchoProcessor", echo);
 
+rdfc_processor_sdk::rdfc_export_processors!();
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use rdfc_processor_sdk::testing::*;
     use rdfc_processor_sdk::make_writer;
+    use rdfc_processor_sdk::testing::*;
     use serde_json::json;
 
     fn args_json() -> serde_json::Value {

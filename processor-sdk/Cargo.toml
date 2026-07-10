@@ -16,3 +16,4 @@ futures = "0.3"
 bytes = "1"
 abi_stable = { workspace = true }
 async-ffi = { workspace = true, features = ["abi_stable"] }
+linkme = "0.3"

@@ -1,0 +1,26 @@
+@prefix rdfc: <https://w3id.org/rdf-connect#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix :     <https://w3id.org/rdf-connect/rust#> .
+
+<> owl:imports <generated.ttl> .
+
+rdfc:SendProcessor a rdfc:Processor ;
+    rdfs:label "Send Processor" ;
+    :rustImplementationOf rdfc:Processor .
+
+[ ] a sh:NodeShape ;
+    sh:targetClass rdfc:SendProcessor ;
+    sh:property [
+        sh:path rdfc:writer ;
+        sh:name "writer" ;
+        sh:class rdfc:Writer ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+    ] , [
+        sh:path rdfc:msgs ;
+        sh:name "msgs" ;
+        sh:datatype xsd:string ;
+    ] .

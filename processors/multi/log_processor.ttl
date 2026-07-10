@@ -1,0 +1,27 @@
+@prefix rdfc: <https://w3id.org/rdf-connect#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix :     <https://w3id.org/rdf-connect/rust#> .
+
+<> owl:imports <generated.ttl> .
+
+rdfc:LogProcessor a rdfc:Processor ;
+    rdfs:label "Log Processor" ;
+    :rustImplementationOf rdfc:Processor .
+
+[ ] a sh:NodeShape ;
+    sh:targetClass rdfc:LogProcessor ;
+    sh:property [
+        sh:path rdfc:reader ;
+        sh:name "reader" ;
+        sh:class rdfc:Reader ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+    ] , [
+        sh:path rdfc:label ;
+        sh:name "label" ;
+        sh:datatype xsd:string ;
+        sh:maxCount 1 ;
+    ] .
