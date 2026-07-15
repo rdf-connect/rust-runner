@@ -240,7 +240,7 @@ impl RunnerState {
         let ctx = ProcessorContext::new(uri.clone(), args, readers, writers);
 
         // Instantiate (may compile/download the processor's cdylib on first run)
-        let mut processor = self
+        let processor = self
             .proc_registry
             .create(&config, &type_uri, ctx)
             .await
@@ -266,17 +266,28 @@ impl RunnerState {
             self.processors.len()
         );
 
-        // Each processor runs in its own task.
-        // Within the task: transform() runs first (consuming channels), then produce().
-        // Since tasks run concurrently across processors, a SendProcessor's produce()
-        // can write while an EchoProcessor's transform() is blocked reading — exactly
-        // the data-flow topology the pipeline describes.
-        for mut proc in self.processors.drain(..) {
+        // `transform` and `produce` run *concurrently* within one processor
+        // (an `Arc` — not a `Box` — is what lets both hold a reference at
+        // once): `transform` only needs to have *started*, not finished,
+        // before any processor's `produce` starts. A processor that reads
+        // forever in `transform` (e.g. Echo) must not block a sibling
+        // processor's `produce` from ever starting, nor its own `produce`
+        // (for processors that both consume and independently emit).
+        //
+        // Tasks also run concurrently across processors, so a SendProcessor's
+        // produce() can write while an EchoProcessor's transform() is blocked
+        // reading — exactly the data-flow topology the pipeline describes.
+        for proc in self.processors.drain(..) {
+            let proc: std::sync::Arc<dyn Processor> = std::sync::Arc::from(proc);
+            let transform_proc = proc.clone();
+            let produce_proc = proc.clone();
             self.tasks.spawn(async move {
-                if let Err(e) = proc.transform().await {
+                let (transform_result, produce_result) =
+                    tokio::join!(transform_proc.transform(), produce_proc.produce());
+                if let Err(e) = transform_result {
                     error!("transform error: {e:#}");
                 }
-                if let Err(e) = proc.produce().await {
+                if let Err(e) = produce_result {
                     error!("produce error: {e:#}");
                 }
             });

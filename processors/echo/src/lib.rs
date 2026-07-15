@@ -1,25 +1,41 @@
 //! Echo processor — forwards every message from `reader` to `writer`.
 
-use rdfc_processor_sdk::{futures::StreamExt, ProcessorArgs, Reader, Writer};
+use rdfc_processor_sdk::{futures::StreamExt, Processor, Reader, Slot, Writer};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct Config {
+pub struct Args {
     reader: Reader,
     writer: Writer,
 }
 
-pub async fn echo(mut args: ProcessorArgs) -> Result<(), String> {
-    let Config { reader, writer } = args.deserialize()?;
-    let mut stream = reader.into_stream();
-    while let Some(bytes) = stream.next().await {
-        writer.write(&bytes).await?;
-    }
-    writer.close();
-    Ok(())
+pub struct Echo {
+    reader: Slot<Reader>,
+    writer: Slot<Writer>,
 }
 
-rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#EchoProcessor", echo);
+impl Processor for Echo {
+    type Args = Args;
+
+    fn new(args: Args) -> Self {
+        Echo {
+            reader: Slot::new(args.reader),
+            writer: Slot::new(args.writer),
+        }
+    }
+
+    async fn transform(&self) -> Result<(), String> {
+        let writer = self.writer.take();
+        let mut stream = self.reader.take().into_stream();
+        while let Some(bytes) = stream.next().await {
+            writer.write(&bytes).await?;
+        }
+        writer.close();
+        Ok(())
+    }
+}
+
+rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#EchoProcessor", Echo);
 
 rdfc_processor_sdk::rdfc_export_processors!();
 
@@ -27,7 +43,7 @@ rdfc_processor_sdk::rdfc_export_processors!();
 
 #[cfg(test)]
 mod tests {
-    use rdfc_processor_sdk::make_writer;
+    use rdfc_processor_sdk::{make_writer, Processor};
     use rdfc_processor_sdk::testing::*;
     use serde_json::json;
 
@@ -42,9 +58,9 @@ mod tests {
     async fn echo_forwards_all_messages() {
         let reader = make_test_reader("mock://reader", vec![b"hello".to_vec(), b"world".to_vec()]);
         let (writer, bridge) = make_writer("mock://writer".to_string());
-        let args = make_test_args(args_json(), [("reader", reader)], [("writer", writer)]);
+        let proc: super::Echo = make_test_processor(args_json(), [("reader", reader)], [("writer", writer)]);
 
-        let (result, (received, closed)) = tokio::join!(super::echo(args), collect_writer(bridge));
+        let (result, (received, closed)) = tokio::join!(proc.transform(), collect_writer(bridge));
 
         result.unwrap();
         assert_eq!(received, vec![b"hello".to_vec(), b"world".to_vec()]);
@@ -55,9 +71,9 @@ mod tests {
     async fn echo_empty_stream_closes_writer() {
         let reader = make_test_reader("mock://reader", vec![]);
         let (writer, bridge) = make_writer("mock://writer".to_string());
-        let args = make_test_args(args_json(), [("reader", reader)], [("writer", writer)]);
+        let proc: super::Echo = make_test_processor(args_json(), [("reader", reader)], [("writer", writer)]);
 
-        let (result, (received, closed)) = tokio::join!(super::echo(args), collect_writer(bridge));
+        let (result, (received, closed)) = tokio::join!(proc.transform(), collect_writer(bridge));
 
         result.unwrap();
         assert!(received.is_empty());

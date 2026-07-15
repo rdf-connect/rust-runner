@@ -10,31 +10,45 @@
 //!
 //! ## Quick start
 //!
+//! Implement [`Processor`] — a three-phase `init` / `transform` / `produce`
+//! lifecycle mirroring RDF-Connect's JS/TS runner — for a type whose
+//! `Args` config is deserialized automatically (`Reader`/`Writer` fields
+//! included) before construction.
+//!
 //! A crate can export any number of processors — call [`rdfc_register!`]
 //! once per processor, then [`rdfc_export_processors!`] exactly once (a
 //! `cdylib` can only have one root-module export; see its docs for why).
 //!
 //! ```rust,ignore
-//! use rdfc_processor_sdk::{ProcessorArgs, Reader, Writer};
-//! use rdfc_processor_sdk::futures::StreamExt;
+//! use rdfc_processor_sdk::{futures::StreamExt, Processor, Reader, Writer};
 //! use serde::Deserialize;
 //!
 //! #[derive(Deserialize)]
-//! struct Config { reader: Reader, writer: Writer }
+//! struct Args { reader: Reader, writer: Writer }
 //!
-//! async fn my_processor(mut args: ProcessorArgs) -> Result<(), String> {
-//!     let Config { reader, writer } = args.deserialize()?;
-//!     let mut stream = reader.into_stream();
-//!     while let Some(bytes) = stream.next().await {
-//!         writer.write(&bytes).await?;
+//! struct MyProcessor { reader: Option<Reader>, writer: Option<Writer> }
+//!
+//! impl Processor for MyProcessor {
+//!     type Args = Args;
+//!
+//!     fn new(args: Args) -> Self {
+//!         MyProcessor { reader: Some(args.reader), writer: Some(args.writer) }
 //!     }
-//!     writer.close();
-//!     Ok(())
+//!
+//!     async fn transform(&mut self) -> Result<(), String> {
+//!         let writer = self.writer.take().unwrap();
+//!         let mut stream = self.reader.take().unwrap().into_stream();
+//!         while let Some(bytes) = stream.next().await {
+//!             writer.write(&bytes).await?;
+//!         }
+//!         writer.close();
+//!         Ok(())
+//!     }
 //! }
 //!
 //! rdfc_register!(
 //!     "https://w3id.org/rdf-connect#MyProcessor",
-//!     my_processor
+//!     MyProcessor
 //! );
 //! rdfc_export_processors!();
 //! ```
@@ -124,6 +138,31 @@ pub type BoxedRawReader = RawReader_TO<'static, RBox<()>>;
 /// A type-erased [`RawWriter`] trait object.
 pub type BoxedRawWriter = RawWriter_TO<'static, RBox<()>>;
 
+// ── Raw processor trait object (phased lifecycle, crosses the FFI boundary) ───
+
+/// FFI-safe interface for a live processor instance, already constructed
+/// from its deserialized arguments.
+///
+/// Implemented (generically, via [`RawProcessorWrapper`]) for every type
+/// that implements [`Processor`]; the runner drives the three phases
+/// through this trait object instead of calling processor code directly.
+#[sabi_trait]
+pub trait RawProcessor: Send + Sync {
+    /// Phase 1 — allocate external resources. Awaited once, before the
+    /// pipeline starts.
+    fn init(&self) -> FfiFuture<RResult<(), RString>>;
+    /// Phase 2 — register/start consuming input channels. Called for every
+    /// processor before any processor's `produce` runs.
+    fn transform(&self) -> FfiFuture<RResult<(), RString>>;
+    /// Phase 3 — emit data on output channels, starting the pipeline. The
+    /// processor is only finished once this returns.
+    #[sabi(last_prefix_field)]
+    fn produce(&self) -> FfiFuture<RResult<(), RString>>;
+}
+
+/// A type-erased [`RawProcessor`] trait object.
+pub type BoxedRawProcessor = RawProcessor_TO<'static, RBox<()>>;
+
 // ── Raw processor arguments (crosses the FFI boundary) ────────────────────────
 
 /// One reader entry, as passed across the FFI boundary.
@@ -164,8 +203,10 @@ pub struct RawProcessorArgs {
 pub struct Registration {
     /// The RDF class URI of this processor (e.g. `"https://w3id.org/rdf-connect#EchoProcessor"`).
     pub type_uri: RStr<'static>,
-    /// Factory function that runs the processor given its arguments.
-    pub factory: extern "C" fn(RawProcessorArgs) -> FfiFuture<RResult<(), RString>>,
+    /// Factory function that deserializes arguments and constructs a live
+    /// processor instance, ready to be driven through its `init` /
+    /// `transform` / `produce` phases via [`RawProcessor`].
+    pub factory: extern "C" fn(RawProcessorArgs) -> RResult<BoxedRawProcessor, RString>,
 }
 
 /// Root module exported by every processor `cdylib` (one per shared library).
@@ -208,7 +249,7 @@ impl RootModule for ProcessorModuleRef {
 #[doc(hidden)]
 pub struct RegistrationEntry {
     pub type_uri: &'static str,
-    pub factory: extern "C" fn(RawProcessorArgs) -> FfiFuture<RResult<(), RString>>,
+    pub factory: extern "C" fn(RawProcessorArgs) -> RResult<BoxedRawProcessor, RString>,
 }
 
 #[doc(hidden)]
@@ -228,25 +269,35 @@ pub use linkme;
 /// # Arguments
 /// - `$type_uri` — the RDF class URI string (must match the class the
 ///   processor's `processor.ttl` shape targets).
-/// - `$fn` — an async function `fn(ProcessorArgs) -> Result<(), String>`.
+/// - `$ty` — a type implementing [`Processor`]. Its `Args` config type is
+///   deserialized from the JSON-LD arguments automatically (any `Reader` /
+///   `Writer` fields are populated exactly like [`ProcessorArgs::deserialize`]
+///   does) before [`Processor::new`] is called.
 #[macro_export]
 macro_rules! rdfc_register {
-    ($type_uri:expr, $fn:path) => {
+    ($type_uri:expr, $ty:ty) => {
         const _: () = {
             extern "C" fn __rdfc_factory(
                 raw: $crate::RawProcessorArgs,
-            ) -> $crate::async_ffi::FfiFuture<
-                $crate::abi_stable::std_types::RResult<(), $crate::abi_stable::std_types::RString>,
+            ) -> $crate::abi_stable::std_types::RResult<
+                $crate::BoxedRawProcessor,
+                $crate::abi_stable::std_types::RString,
             > {
-                use $crate::async_ffi::FutureExt;
-                async move {
-                    let args = $crate::ProcessorArgs::from_raw(raw);
-                    match $fn(args).await {
-                        Ok(()) => $crate::abi_stable::std_types::RResult::ROk(()),
-                        Err(e) => $crate::abi_stable::std_types::RResult::RErr(e.into()),
+                use $crate::abi_stable::std_types::{RResult, RString};
+
+                let mut args = $crate::ProcessorArgs::from_raw(raw);
+                match args.deserialize::<<$ty as $crate::Processor>::Args>() {
+                    Ok(config) => {
+                        let processor = <$ty as $crate::Processor>::new(config);
+                        let wrapper = $crate::RawProcessorWrapper::new(processor);
+                        let boxed = $crate::RawProcessor_TO::from_value(
+                            wrapper,
+                            $crate::abi_stable::sabi_trait::prelude::TD_Opaque,
+                        );
+                        RResult::ROk(boxed)
                     }
+                    Err(e) => RResult::RErr(RString::from(e)),
                 }
-                .into_ffi()
             }
 
             #[$crate::linkme::distributed_slice($crate::REGISTRATIONS)]
@@ -635,6 +686,179 @@ impl ProcessorArgs {
     }
 }
 
+// ── Processor trait (ergonomic, phased lifecycle) ──────────────────────────────
+
+/// Implemented by processor authors instead of hand-rolling an
+/// `async fn(ProcessorArgs) -> Result<(), String>` and calling
+/// [`ProcessorArgs::deserialize`] themselves.
+///
+/// `Args` is the processor's config type: [`rdfc_register!`] deserializes it
+/// automatically from the JSON-LD arguments (any `Reader`/`Writer` fields
+/// are populated the same way [`ProcessorArgs::deserialize`] does) and hands
+/// the result to [`Processor::new`] — processor code never touches
+/// [`ProcessorArgs`] directly.
+///
+/// Mirrors the three-phase lifecycle of RDF-Connect's JS/TS runner
+/// (`Processor<T>` there): a processor only implements whichever phases it
+/// actually needs — all three default to a no-op.
+///
+/// - `init` — allocate external resources (e.g. open a DB connection);
+///   awaited once per processor, before the pipeline starts.
+/// - `transform` — register / start consuming input channels; only needs to
+///   have *started* (not finished) before any processor's `produce` starts.
+/// - `produce` — emit data on output channels, starting the pipeline.
+///
+/// **`transform` and `produce` run concurrently** — the runner starts both
+/// at (roughly) the same time and awaits them together, it does not wait
+/// for `transform` to finish first. That's why both take `&self` rather
+/// than `&mut self`: a processor that needs state in both phases (or that
+/// needs to hand a `Reader`/`Writer` to whichever phase uses it) must use
+/// its own interior synchronization. [`Slot`] covers the common case of a
+/// resource consumed by exactly one phase.
+///
+/// ```rust,ignore
+/// use rdfc_processor_sdk::{futures::StreamExt, Processor, Reader, Slot, Writer};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Args { reader: Reader, writer: Writer }
+///
+/// struct Echo { reader: Slot<Reader>, writer: Slot<Writer> }
+///
+/// impl Processor for Echo {
+///     type Args = Args;
+///
+///     fn new(args: Args) -> Self {
+///         Echo { reader: Slot::new(args.reader), writer: Slot::new(args.writer) }
+///     }
+///
+///     async fn transform(&self) -> Result<(), String> {
+///         let writer = self.writer.take();
+///         let mut stream = self.reader.take().into_stream();
+///         while let Some(bytes) = stream.next().await {
+///             writer.write(&bytes).await?;
+///         }
+///         writer.close();
+///         Ok(())
+///     }
+/// }
+///
+/// rdfc_register!("https://w3id.org/rdf-connect#EchoProcessor", Echo);
+/// ```
+pub trait Processor: Send + Sync + 'static {
+    /// The processor's config type, deserialized from JSON-LD arguments.
+    type Args: serde::de::DeserializeOwned + Send;
+
+    /// Construct the processor from its already-deserialized arguments.
+    /// Purely synchronous setup — use `init` for anything that needs to run
+    /// (and be awaited) asynchronously.
+    fn new(args: Self::Args) -> Self;
+
+    /// Phase 1 — allocate external resources. Defaults to a no-op.
+    fn init(&self) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Phase 2 — register/start consuming input channels. Defaults to a
+    /// no-op. Runs concurrently with `produce` — see the trait-level docs.
+    fn transform(&self) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Phase 3 — emit data on output channels, starting the pipeline.
+    /// Defaults to a no-op. Runs concurrently with `transform` — see the
+    /// trait-level docs.
+    fn produce(&self) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
+}
+
+/// A `Sync` cell that can be handed off exactly once.
+///
+/// [`Processor::transform`]/[`Processor::produce`] take `&self` (so the
+/// runner can run them concurrently), but a resource like a `Reader` or
+/// `Writer` is still normally consumed by exactly one of them. `Slot` lets a
+/// processor field hold such a resource and `take()` it out from whichever
+/// phase actually uses it, panicking if that phase is (incorrectly) entered
+/// twice or if the resource was never meant for it.
+pub struct Slot<T> {
+    inner: std::sync::Mutex<Option<T>>,
+}
+
+impl<T> Slot<T> {
+    pub fn new(value: T) -> Self {
+        Slot {
+            inner: std::sync::Mutex::new(Some(value)),
+        }
+    }
+
+    /// Take the value out. Panics if it was already taken.
+    pub fn take(&self) -> T {
+        self.inner
+            .lock()
+            .unwrap()
+            .take()
+            .expect("Slot::take() called twice")
+    }
+}
+
+/// Adapts any [`Processor`] into the FFI-safe [`RawProcessor`] trait object
+/// [`rdfc_register!`] exports. Not normally constructed directly by
+/// processor authors.
+///
+/// Holds the processor behind an `Arc` (rather than borrowing `&mut self`)
+/// so each phase method can hand `async_ffi` a `'static` future — and, since
+/// [`Processor`]'s phase methods take `&self`, so `transform` and `produce`
+/// can be polled concurrently without one blocking the other.
+#[doc(hidden)]
+pub struct RawProcessorWrapper<P: Processor> {
+    inner: Arc<P>,
+}
+
+impl<P: Processor> RawProcessorWrapper<P> {
+    pub fn new(processor: P) -> Self {
+        RawProcessorWrapper {
+            inner: Arc::new(processor),
+        }
+    }
+}
+
+impl<P: Processor> RawProcessor for RawProcessorWrapper<P> {
+    fn init(&self) -> FfiFuture<RResult<(), RString>> {
+        let inner = self.inner.clone();
+        async move {
+            match inner.init().await {
+                Ok(()) => RResult::ROk(()),
+                Err(e) => RResult::RErr(RString::from(e)),
+            }
+        }
+        .into_ffi()
+    }
+
+    fn transform(&self) -> FfiFuture<RResult<(), RString>> {
+        let inner = self.inner.clone();
+        async move {
+            match inner.transform().await {
+                Ok(()) => RResult::ROk(()),
+                Err(e) => RResult::RErr(RString::from(e)),
+            }
+        }
+        .into_ffi()
+    }
+
+    fn produce(&self) -> FfiFuture<RResult<(), RString>> {
+        let inner = self.inner.clone();
+        async move {
+            match inner.produce().await {
+                Ok(()) => RResult::ROk(()),
+                Err(e) => RResult::RErr(RString::from(e)),
+            }
+        }
+        .into_ffi()
+    }
+}
+
+
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 /// Utilities for writing unit tests against processor functions.
@@ -692,5 +916,18 @@ pub mod testing {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect::<HashMap<_, _>>(),
         )
+    }
+
+    /// Build a [`Processor`] instance for testing directly from raw JSON and
+    /// pre-built channels — the same deserialize-then-`new` path
+    /// [`rdfc_register!`] generates, without going through the FFI boundary.
+    pub fn make_test_processor<P: super::Processor>(
+        json: serde_json::Value,
+        readers: impl IntoIterator<Item = (&'static str, Reader)>,
+        writers: impl IntoIterator<Item = (&'static str, Writer)>,
+    ) -> P {
+        let mut args = make_test_args(json, readers, writers);
+        let config: P::Args = args.deserialize().expect("valid processor args");
+        P::new(config)
     }
 }

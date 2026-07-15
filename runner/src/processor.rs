@@ -14,12 +14,19 @@ use crate::channel::{bridge_reader, bridge_writer, Reader, Writer};
 /// Three-phase lifecycle:
 /// 1. `init`      – allocate external resources; awaited before `ProcessorInitialized`.
 /// 2. `transform` – register listeners / start consuming input channels.
-/// 3. `produce`   – emit data on output channels; called after the `start` signal.
+/// 3. `produce`   – emit data on output channels; started after the `start`
+///    signal, at the same time as `transform` — `transform` is only
+///    required to have *started* (not finished) before any processor's
+///    `produce` starts (see `RunnerState::start_processors`). Both take
+///    `&self` (rather than `&mut self`) precisely so a processor can run
+///    both concurrently; any state shared between them needs its own
+///    interior synchronization (e.g. [`rdfc_processor_sdk::Slot`] for a
+///    take-once `Reader`/`Writer`).
 #[async_trait]
-pub trait Processor: Send {
-    async fn init(&mut self) -> Result<()>;
-    async fn transform(&mut self) -> Result<()>;
-    async fn produce(&mut self) -> Result<()>;
+pub trait Processor: Send + Sync {
+    async fn init(&self) -> Result<()>;
+    async fn transform(&self) -> Result<()>;
+    async fn produce(&self) -> Result<()>;
 }
 
 // ── Context ───────────────────────────────────────────────────────────────────

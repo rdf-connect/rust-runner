@@ -1,9 +1,10 @@
 [package]
 name = "rdfc-processor-buildtools"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Build-time and CI tooling that generates a processor's :artifact/:abiStable manifest"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "rdfc_processor_buildtools"
@@ -14,7 +15,7 @@ name = "rdfc-processor-buildtools"
 path = "src/main.rs"
 
 [dependencies]
-rdfc-processor-sdk = { path = "../processor-sdk" }
+rdfc-processor-sdk = { workspace = true }
 oxttl = "0.2"
 oxrdf = "0.3"
 sha2 = "0.11.0"

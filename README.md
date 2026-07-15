@@ -117,32 +117,61 @@ rdfc-processor-sdk = { path = "../processor-sdk" }
 abi_stable = "=0.11.3"
 ```
 
-Implement your processor as an `async fn` that takes [`ProcessorArgs`] and calls `.deserialize()` into a `#[derive(Deserialize)]` config struct. `Reader` and `Writer` fields are populated automatically from the pipeline arguments:
+Implement your processor as a type implementing [`Processor`], with an
+associated `Args` config type deserialized automatically — `Reader` and
+`Writer` fields are populated from the pipeline arguments the same way
+before your `new` is called. The three-phase lifecycle (`init` /
+`transform` / `produce`) mirrors RDF-Connect's JS/TS runner; implement only
+whichever phases your processor needs — all three default to a no-op.
+`transform` and `produce` take `&self` (not `&mut self`) because **they run
+concurrently**: the runner starts both together and awaits them together,
+it does not wait for `transform` to finish before starting `produce`. Use
+[`Slot`] for a resource (like a `Reader`/`Writer`) that's consumed by
+exactly one of the two phases:
 
 ```rust
-use rdfc_processor_sdk::{futures::StreamExt, ProcessorArgs, Reader, Writer};
+use rdfc_processor_sdk::{futures::StreamExt, Processor, Reader, Slot, Writer};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct Config {
+struct Args {
     input:  Reader,
     output: Writer,
     label:  Option<String>,
 }
 
-async fn my_processor(mut args: ProcessorArgs) -> Result<(), String> {
-    let Config { input, output, label } = args.deserialize()?;
-    let label = label.unwrap_or_else(|| "proc".into());
-    let mut stream = input.into_stream();
-    while let Some(bytes) = stream.next().await {
-        eprintln!("[{label}] {} bytes", bytes.len());
-        output.write(&bytes).await?;
-    }
-    output.close();
-    Ok(())
+struct MyProcessor {
+    input: Slot<Reader>,
+    output: Slot<Writer>,
+    label: String,
 }
 
-rdfc_processor_sdk::rdfc_register!("https://example.org/my-vocab#MyProcessor", my_processor);
+impl Processor for MyProcessor {
+    type Args = Args;
+
+    fn new(args: Args) -> Self {
+        MyProcessor {
+            input: Slot::new(args.input),
+            output: Slot::new(args.output),
+            label: args.label.unwrap_or_else(|| "proc".into()),
+        }
+    }
+
+    // Runs concurrently with `produce` (see above) — only its *start* is
+    // ordered relative to every other processor's `produce`.
+    async fn transform(&self) -> Result<(), String> {
+        let output = self.output.take();
+        let mut stream = self.input.take().into_stream();
+        while let Some(bytes) = stream.next().await {
+            eprintln!("[{}] {} bytes", self.label, bytes.len());
+            output.write(&bytes).await?;
+        }
+        output.close();
+        Ok(())
+    }
+}
+
+rdfc_processor_sdk::rdfc_register!("https://example.org/my-vocab#MyProcessor", MyProcessor);
 ```
 
 `rdfc_register!` is the crate's single exported entry point (one processor
@@ -153,6 +182,19 @@ needing any link-time collection tricks.
 ### Field names
 
 Field names in the config struct must match the `sh:name` values declared in the processor's SHACL shape in your pipeline `.ttl`.
+
+### Lifecycle phases
+
+| Phase | When | Typical use |
+|-------|------|-------------|
+| `init` | Awaited once per processor, before the pipeline starts | Allocate external resources (DB connections, etc.) |
+| `transform` | Started for every processor before any processor's `produce` starts, then runs *concurrently* with `produce` | Register/start consuming input channels |
+| `produce` | Started once every processor has started `transform`, running concurrently with it | Emit data on output channels, starting the pipeline |
+
+A processor is only considered finished once both `transform` and `produce`
+have returned — since they run concurrently, a processor that reads forever
+in `transform` (like `echo`, above) doesn't block its own `produce` (or any
+other processor's) from running.
 
 ### Reader / Writer
 

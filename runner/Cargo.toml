@@ -1,9 +1,10 @@
 [package]
 name = "rdfc-rust-runner"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Rust runner implementation for RDF-Connect"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "rust-runner"
@@ -14,7 +15,7 @@ name = "rdfc_rust_runner"
 path = "src/lib.rs"
 
 [dependencies]
-rdfc-processor-sdk = { path = "../processor-sdk" }
+rdfc-processor-sdk = { workspace = true }
 abi_stable = { workspace = true }
 async-ffi = { workspace = true, features = ["abi_stable"] }
 

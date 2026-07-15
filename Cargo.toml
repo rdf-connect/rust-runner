@@ -10,6 +10,12 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/rdf-connect/rust-runner"
+
 # Pinned exactly: the abi_stable / async-ffi versions here define the plugin
 # ABI. The runner and every processor cdylib must be built against the exact
 # same versions, or `abi_stable`'s layout check will refuse to load the
@@ -17,3 +23,5 @@ resolver = "2"
 [workspace.dependencies]
 abi_stable = "=0.11.3"
 async-ffi = "=0.5.0"
+rdfc-processor-sdk = { path = "processor-sdk", version = "0.3.0" }
+rdfc-processor-buildtools = { path = "processor-buildtools", version = "0.3.0" }

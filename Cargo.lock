@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "rdfc-processor-buildtools"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "oxrdf",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "rdfc-processor-echo"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "rdfc-processor-buildtools",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "rdfc-processor-log"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "rdfc-processor-buildtools",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "rdfc-processor-multi"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "rdfc-processor-buildtools",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "rdfc-processor-sdk"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "async-ffi",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "rdfc-processor-send"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "rdfc-processor-buildtools",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "rdfc-rust-runner"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "anyhow",

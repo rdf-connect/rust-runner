@@ -1,25 +1,41 @@
 //! Send processor — writes a predefined list of messages from args then closes.
 
-use rdfc_processor_sdk::{ProcessorArgs, Writer};
+use rdfc_processor_sdk::{Processor, Slot, Writer};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct Config {
+pub struct Args {
     writer: Writer,
     #[serde(default)]
     msgs: Vec<String>,
 }
 
-pub async fn send_proc(mut args: ProcessorArgs) -> Result<(), String> {
-    let Config { writer, msgs } = args.deserialize()?;
-    for msg in &msgs {
-        writer.write_str(msg).await?;
-    }
-    writer.close();
-    Ok(())
+pub struct Send {
+    writer: Slot<Writer>,
+    msgs: Vec<String>,
 }
 
-rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#SendProcessor", send_proc);
+impl Processor for Send {
+    type Args = Args;
+
+    fn new(args: Args) -> Self {
+        Send {
+            writer: Slot::new(args.writer),
+            msgs: args.msgs,
+        }
+    }
+
+    async fn produce(&self) -> Result<(), String> {
+        let writer = self.writer.take();
+        for msg in &self.msgs {
+            writer.write_str(msg).await?;
+        }
+        writer.close();
+        Ok(())
+    }
+}
+
+rdfc_processor_sdk::rdfc_register!("https://w3id.org/rdf-connect#SendProcessor", Send);
 rdfc_processor_sdk::rdfc_export_processors!();
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -27,12 +43,12 @@ rdfc_processor_sdk::rdfc_export_processors!();
 #[cfg(test)]
 mod tests {
     use rdfc_processor_sdk::testing::*;
-    use rdfc_processor_sdk::make_writer;
+    use rdfc_processor_sdk::{make_writer, Processor};
     use serde_json::json;
 
     async fn run_send(msgs: serde_json::Value) -> (Vec<Vec<u8>>, bool) {
         let (writer, bridge) = make_writer("mock://writer".to_string());
-        let args = make_test_args(
+        let proc: super::Send = make_test_processor(
             json!({
                 "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"},
                 "msgs": msgs
@@ -40,7 +56,7 @@ mod tests {
             [],
             [("writer", writer)],
         );
-        let (result, collected) = tokio::join!(super::send_proc(args), collect_writer(bridge));
+        let (result, collected) = tokio::join!(proc.produce(), collect_writer(bridge));
         result.unwrap();
         collected
     }

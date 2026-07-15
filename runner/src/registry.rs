@@ -347,66 +347,62 @@ fn load_dynamic(so_path: &Path, type_uri: &str, ctx: ProcessorContext) -> Result
             )
         })?;
 
-    Ok(Box::new(DynamicProcessor::new(registration.factory, ctx)))
+    // Deserializing arguments and constructing the processor instance is
+    // synchronous (see `rdfc_register!`), so this can happen immediately —
+    // the returned `BoxedRawProcessor` is then driven through its
+    // `init`/`transform`/`produce` phases by `DynamicProcessor`.
+    let raw_args = ctx.into_raw_args();
+    match (registration.factory)(raw_args) {
+        rdfc_processor_sdk::abi_stable::std_types::RResult::ROk(raw) => {
+            Ok(Box::new(DynamicProcessor::new(raw)))
+        }
+        rdfc_processor_sdk::abi_stable::std_types::RResult::RErr(e) => {
+            bail!("failed to construct processor '{type_uri}': {e}")
+        }
+    }
 }
 
-/// Wraps a loaded processor's `factory` fn as an async [`Processor`].
+/// Wraps a loaded processor's [`rdfc_processor_sdk::BoxedRawProcessor`] as
+/// an async [`Processor`], forwarding each phase straight through the FFI
+/// boundary.
 struct DynamicProcessor {
-    factory: extern "C" fn(
-        rdfc_processor_sdk::RawProcessorArgs,
-    ) -> rdfc_processor_sdk::async_ffi::FfiFuture<
-        rdfc_processor_sdk::abi_stable::std_types::RResult<
-            (),
-            rdfc_processor_sdk::abi_stable::std_types::RString,
-        >,
-    >,
-    ctx: Option<ProcessorContext>, // taken in produce()
+    raw: rdfc_processor_sdk::BoxedRawProcessor,
 }
 
 impl DynamicProcessor {
-    fn new(
-        factory: extern "C" fn(
-            rdfc_processor_sdk::RawProcessorArgs,
-        ) -> rdfc_processor_sdk::async_ffi::FfiFuture<
-            rdfc_processor_sdk::abi_stable::std_types::RResult<
-                (),
-                rdfc_processor_sdk::abi_stable::std_types::RString,
-            >,
-        >,
-        ctx: ProcessorContext,
-    ) -> Self {
-        DynamicProcessor {
-            factory,
-            ctx: Some(ctx),
-        }
+    fn new(raw: rdfc_processor_sdk::BoxedRawProcessor) -> Self {
+        DynamicProcessor { raw }
     }
 }
 
 #[async_trait::async_trait]
 impl Processor for DynamicProcessor {
-    async fn init(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn transform(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    /// Run the processor by calling its exported factory and awaiting the
-    /// returned `FfiFuture` directly — no dedicated OS thread needed, since
-    /// polling an `FfiFuture` just calls back into the (already-loaded)
-    /// processor's own compiled code.
-    async fn produce(&mut self) -> Result<()> {
-        let ctx = self
-            .ctx
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("DynamicProcessor.produce() called twice"))?;
-
-        let raw_args = ctx.into_raw_args();
-        match (self.factory)(raw_args).await {
+    /// Awaits the exported `init` `FfiFuture` directly — no dedicated OS
+    /// thread needed, since polling it just calls back into the
+    /// (already-loaded) processor's own compiled code.
+    async fn init(&self) -> Result<()> {
+        match self.raw.init().await {
             rdfc_processor_sdk::abi_stable::std_types::RResult::ROk(()) => Ok(()),
             rdfc_processor_sdk::abi_stable::std_types::RResult::RErr(e) => {
-                bail!("processor returned an error: {e}")
+                bail!("processor init failed: {e}")
+            }
+        }
+    }
+
+    async fn transform(&self) -> Result<()> {
+        match self.raw.transform().await {
+            rdfc_processor_sdk::abi_stable::std_types::RResult::ROk(()) => Ok(()),
+            rdfc_processor_sdk::abi_stable::std_types::RResult::RErr(e) => {
+                bail!("processor transform failed: {e}")
+            }
+        }
+    }
+
+    async fn produce(&self) -> Result<()> {
+        match self.raw.produce().await {
+            rdfc_processor_sdk::abi_stable::std_types::RResult::ROk(()) => Ok(()),
+            rdfc_processor_sdk::abi_stable::std_types::RResult::RErr(e) => {
+                bail!("processor produce failed: {e}")
             }
         }
     }

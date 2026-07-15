@@ -1,13 +1,16 @@
 [package]
 name = "rdfc-processor-send"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+description = "Send processor for RDF-Connect: writes a predefined list of messages then closes"
+license.workspace = true
+repository.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rdfc-processor-sdk = { path = "../../processor-sdk" }
+rdfc-processor-sdk = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 # `abi_stable`'s `#[export_root_module]` macro expands to code with an
 # absolute `::abi_stable::...` path, so it must be a direct dependency here
@@ -15,7 +18,7 @@ serde = { version = "1", features = ["derive"] }
 abi_stable = { workspace = true }
 
 [build-dependencies]
-rdfc-processor-buildtools = { path = "../../processor-buildtools" }
+rdfc-processor-buildtools = { workspace = true }
 
 [dev-dependencies]
 serde_json = "1"
