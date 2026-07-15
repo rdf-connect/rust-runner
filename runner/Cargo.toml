@@ -1,6 +1,6 @@
 [package]
 name = "rdfc-rust-runner"
-version.workspace = true
+version = "0.3.0"
 edition.workspace = true
 description = "Rust runner implementation for RDF-Connect"
 license.workspace = true
