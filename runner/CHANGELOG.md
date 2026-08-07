@@ -5,7 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## v0.3.0 (2026-08-07)
+## v0.3.1 (2026-08-07)
+
+### Bug Fixes
+
+ - <csr-id-de28ae3993dcd3628cc80836c8f23b01f9b2eb75/> don't drop channels in multi-valued Reader/Writer properties
+   Two bugs made a multi-valued Reader/Writer SHACL property (one without
+   sh:maxCount, e.g. kolibrie-processor's `readers: Vec<Reader>`) lose every
+   channel before it reached the processor:
+   
+   - extract_channels recursed into array items without threading the
+     enclosing field's key through — its "field name provided by the caller"
+     branch only fires for the singular case reached via the Object arm — so
+     array items were silently dropped. Array items are now matched against
+     the same Reader/Writer shape, still tagged with the property's key, and
+     only fall back to a plain recursive walk when they aren't channel refs.
+   - ProcessorContext's readers/writers were HashMap<String, _> keyed by
+     field name, which collapsed multiple channels sharing one field name to
+     a single entry even after the extraction fix. Switched to
+     Vec<(String, _)>; the field name isn't used past this point, since
+     into_raw_args only forwards each channel's own URI.
+   
+   Covered by three extract_channels unit tests (singular, multi-valued
+   array, array mixing channels with other values).
+
+### Commit Statistics
+
+<csr-read-only-do-not-edit/>
+
+ - 2 commits contributed to the release.
+ - 22 days passed between releases.
+ - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 0 issues like '(#ID)' were seen in commit messages
+
+### Commit Details
+
+<csr-read-only-do-not-edit/>
+
+<details><summary>view details</summary>
+
+ * **Uncategorized**
+    - Release rdfc-rust-runner v0.3.0 ([`44677ac`](https://github.com/rdf-connect/rust-runner/commit/44677acf4b7bc4256da00b3a9d4b0c15bd198e0f))
+    - Don't drop channels in multi-valued Reader/Writer properties ([`de28ae3`](https://github.com/rdf-connect/rust-runner/commit/de28ae3993dcd3628cc80836c8f23b01f9b2eb75))
+</details>
+
+## v0.3.0 (2026-07-15)
 
 ### New Features
 
@@ -47,16 +91,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    channel before it reached the processor:
    
    - extract_channels recursed into array items without threading the
-     enclosing field's key through — its "field name provided by the caller"
-     branch only fires for the singular case reached via the Object arm — so
-     array items were silently dropped. Array items are now matched against
-     the same Reader/Writer shape, still tagged with the property's key, and
-     only fall back to a plain recursive walk when they aren't channel refs.
+   enclosing field's key through — its "field name provided by the caller"
+   branch only fires for the singular case reached via the Object arm — so
+   array items were silently dropped. Array items are now matched against
+   the same Reader/Writer shape, still tagged with the property's key, and
+   only fall back to a plain recursive walk when they aren't channel refs.
    - ProcessorContext's readers/writers were HashMap<String, _> keyed by
-     field name, which collapsed multiple channels sharing one field name to
-     a single entry even after the extraction fix. Switched to
-     Vec<(String, _)>; the field name isn't used past this point, since
-     into_raw_args only forwards each channel's own URI.
+   field name, which collapsed multiple channels sharing one field name to
+   a single entry even after the extraction fix. Switched to
+   Vec<(String, _)>; the field name isn't used past this point, since
+   into_raw_args only forwards each channel's own URI.
    
    Covered by three extract_channels unit tests (singular, multi-valued
    array, array mixing channels with other values).
@@ -65,9 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <csr-read-only-do-not-edit/>
 
- - 1 commit contributed to the release.
- - 22 days passed between releases.
- - 1 commit was understood as [conventional](https://www.conventionalcommits.org).
+ - 6 commits contributed to the release over the course of 29 calendar days.
+ - 4 commits were understood as [conventional](https://www.conventionalcommits.org).
  - 0 issues like '(#ID)' were seen in commit messages
 
 ### Commit Details
@@ -77,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <details><summary>view details</summary>
 
  * **Uncategorized**
-    - Don't drop channels in multi-valued Reader/Writer properties ([`de28ae3`](https://github.com/rdf-connect/rust-runner/commit/de28ae3993dcd3628cc80836c8f23b01f9b2eb75))
+    - Release rdfc-processor-sdk v0.3.0, rdfc-processor-buildtools v0.3.0, rdfc-rust-runner v0.3.0 ([`f1d008f`](https://github.com/rdf-connect/rust-runner/commit/f1d008f29e87da9dcb2c00331367a48c74308bf3))
+    - Release rdfc-processor-sdk v0.3.0, rdfc-processor-buildtools v0.3.0, rdfc-rust-runner v0.3.0 ([`4df506d`](https://github.com/rdf-connect/rust-runner/commit/4df506d78e805e6502694e1de6acee1923a8d573))
+    - Move to trait based processors ([`2edb664`](https://github.com/rdf-connect/rust-runner/commit/2edb6648794a8255a93994c00c2cf779ce477b75))
+    - Load processors as abi_stable cdylibs via owl:imports ([`81c412e`](https://github.com/rdf-connect/rust-runner/commit/81c412e8aa30f3af642a6300aeacc84261c3edca))
+    - Claude fixed some things ([`2b4cefa`](https://github.com/rdf-connect/rust-runner/commit/2b4cefa821f5600667a13d28b5c4e6bb9050faa5))
+    - Initial implementation ([`c92371a`](https://github.com/rdf-connect/rust-runner/commit/c92371aed1056388b8f495437867094b05fd7700))
 </details>
 
