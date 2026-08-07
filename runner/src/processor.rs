@@ -1,7 +1,5 @@
 //! Processor trait and the context object handed to each processor at startup.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -36,16 +34,21 @@ pub struct ProcessorContext {
     pub uri: String,
     /// Parsed JSON-LD arguments (Reader/Writer fields already extracted).
     pub args: serde_json::Value,
-    readers: HashMap<String, Reader>,
-    writers: HashMap<String, Writer>,
+    // `Vec`, not `HashMap`: a multi-valued Reader/Writer SHACL property (no
+    // `sh:maxCount`) produces several entries under the *same* field name —
+    // a map keyed by field name would silently collapse them to one. The
+    // field name itself isn't used past this point (`into_raw_args` below
+    // only forwards each channel's own URI), so a plain list is sufficient.
+    readers: Vec<(String, Reader)>,
+    writers: Vec<(String, Writer)>,
 }
 
 impl ProcessorContext {
     pub fn new(
         uri: String,
         args: serde_json::Value,
-        readers: HashMap<String, Reader>,
-        writers: HashMap<String, Writer>,
+        readers: Vec<(String, Reader)>,
+        writers: Vec<(String, Writer)>,
     ) -> Self {
         ProcessorContext { uri, args, readers, writers }
     }

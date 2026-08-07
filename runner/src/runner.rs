@@ -80,7 +80,34 @@ fn extract_channels(
                         }
                     }
                     serde_json::Value::Array(arr) => {
+                        // A multi-valued Reader/Writer property (e.g. an
+                        // `sh:property` with no `sh:maxCount`) shows up here
+                        // as an array of `{"@type": Reader|Writer, "@id": ...}`
+                        // objects. Recursing straight into `extract_channels`
+                        // would lose `key` (its "field name is provided by
+                        // the caller" branch only fires for the *singular*
+                        // case, reached via the Object arm above), silently
+                        // dropping every channel in the array. Check each
+                        // item against the same Reader/Writer shape first,
+                        // still tagged with this property's `key`, and only
+                        // fall back to a plain recursive walk for items that
+                        // aren't themselves channel references.
                         for item in arr {
+                            if let serde_json::Value::Object(inner) = item {
+                                let t = inner
+                                    .get("@type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let id =
+                                    inner.get("@id").and_then(|v| v.as_str()).unwrap_or_default();
+                                if t == RDFC_READER && !id.is_empty() {
+                                    readers.push((key.clone(), id.to_string()));
+                                    continue;
+                                } else if t == RDFC_WRITER && !id.is_empty() {
+                                    writers.push((key.clone(), id.to_string()));
+                                    continue;
+                                }
+                            }
                             extract_channels(item, readers, writers);
                         }
                     }
@@ -223,18 +250,20 @@ impl RunnerState {
         let mut writer_refs: Vec<(String, String)> = Vec::new();
         extract_channels(&args, &mut reader_refs, &mut writer_refs);
 
-        // Create Reader instances
-        let mut readers = HashMap::new();
+        // Create Reader instances. A `Vec`, not a `HashMap`: multiple entries
+        // can (and for a multi-valued Reader property, will) share the same
+        // `field_name` — see `ProcessorContext`'s own doc comment.
+        let mut readers = Vec::with_capacity(reader_refs.len());
         for (field_name, channel_uri) in reader_refs {
             let reader = self.get_or_create_reader(channel_uri.clone());
-            readers.insert(field_name, reader);
+            readers.push((field_name, reader));
         }
 
         // Create Writer instances
-        let mut writers = HashMap::new();
+        let mut writers = Vec::with_capacity(writer_refs.len());
         for (field_name, channel_uri) in writer_refs {
             let writer = self.get_or_create_writer(channel_uri.clone());
-            writers.insert(field_name, writer);
+            writers.push((field_name, writer));
         }
 
         let ctx = ProcessorContext::new(uri.clone(), args, readers, writers);
@@ -479,4 +508,63 @@ pub async fn run(addr: String, runner_uri: String) -> Result<()> {
     info!("all processors finished");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_singular_reader_and_writer() {
+        let args = json!({
+            "reader": {"@type": RDFC_READER, "@id": "urn:in"},
+            "writer": {"@type": RDFC_WRITER, "@id": "urn:out"}
+        });
+        let mut readers = Vec::new();
+        let mut writers = Vec::new();
+        extract_channels(&args, &mut readers, &mut writers);
+        assert_eq!(readers, vec![("reader".to_string(), "urn:in".to_string())]);
+        assert_eq!(writers, vec![("writer".to_string(), "urn:out".to_string())]);
+    }
+
+    #[test]
+    fn extracts_every_reader_in_a_multi_valued_array_property() {
+        // A multi-valued SHACL property (no sh:maxCount) — e.g. kolibrie-processor's
+        // `readers: Vec<Reader>` — serialises as a JSON array of Reader objects
+        // under one field name.
+        let args = json!({
+            "readers": [
+                {"@type": RDFC_READER, "@id": "urn:a"},
+                {"@type": RDFC_READER, "@id": "urn:b"},
+                {"@type": RDFC_READER, "@id": "urn:c"}
+            ]
+        });
+        let mut readers = Vec::new();
+        let mut writers = Vec::new();
+        extract_channels(&args, &mut readers, &mut writers);
+        assert_eq!(
+            readers,
+            vec![
+                ("readers".to_string(), "urn:a".to_string()),
+                ("readers".to_string(), "urn:b".to_string()),
+                ("readers".to_string(), "urn:c".to_string()),
+            ]
+        );
+        assert!(writers.is_empty());
+    }
+
+    #[test]
+    fn array_property_mixing_channels_with_other_values_only_extracts_channels() {
+        let args = json!({
+            "readers": [
+                {"@type": RDFC_READER, "@id": "urn:a"},
+                {"not": "a channel"}
+            ]
+        });
+        let mut readers = Vec::new();
+        let mut writers = Vec::new();
+        extract_channels(&args, &mut readers, &mut writers);
+        assert_eq!(readers, vec![("readers".to_string(), "urn:a".to_string())]);
+    }
 }
