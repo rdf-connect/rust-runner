@@ -10,6 +10,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@rdfc/orchestrator-js": "^2.2.1"
+    "@rdfc/orchestrator-js": "^2.3.0"
   }
 }
